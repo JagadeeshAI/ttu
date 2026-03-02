@@ -1,0 +1,6 @@
+# Ignore JSON files
+*.json
+*.jsonl
+
+# Ignore checkpoints directory
+checkpoints/
