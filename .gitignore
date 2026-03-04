@@ -4,3 +4,8 @@
 
 # Ignore checkpoints directory
 checkpoints/
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.env
