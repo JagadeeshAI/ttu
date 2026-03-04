@@ -1,6 +1,6 @@
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import LoraConfig, get_peft_model, TaskType
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
 from tqdm import tqdm
 import os
 import random
@@ -82,16 +82,23 @@ def getmodel(model_path=None):
         print(f"🔄 Loading model from: {model_path}")
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
-            dtype=torch.float16,
+            torch_dtype=torch.bfloat16,
             device_map="auto"
         )
     else:
-        print(f"🔄 Loading fresh model: {MODEL_NAME}")
+        print(f"🔄 Loading fresh model: {MODEL_NAME} (4-bit QLoRA)")
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_NAME,
-            dtype=torch.float16,
+            quantization_config=bnb_config,
             device_map="auto"
         )
+        model = prepare_model_for_kbit_training(model)
 
         # LoRA configuration - apply to FFN layers only
         lora_config = LoraConfig(
