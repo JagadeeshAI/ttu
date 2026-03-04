@@ -10,20 +10,19 @@ import os
 import warnings
 import random
 from codes.data import get_train_val_loaders, ProfileDataset, collate_fn
-from codes.utils import calculate_token_accuracy,  getmodel
-from codes.config import  BATCH_SIZE, EPOCHS, LR, DEVICE, SAVE_DIR
+from codes.utils import calculate_token_accuracy, getmodel
+from codes.config import BATCH_SIZE, EPOCHS, LR, DEVICE, SAVE_DIR
+
 # Suppress warnings
 warnings.filterwarnings("ignore")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-
 os.makedirs(SAVE_DIR, exist_ok=True)
-
 
 # ============ TRAINING ============
 def train():
     print("🔄 Loading data...")
-    train_data, val_data = get_train_val_loaders("data/data.json")
+    train_data, val_data = get_train_val_loaders("data/bio.jsonl")
 
     model, tokenizer = getmodel()
 
@@ -70,7 +69,7 @@ def train():
                 labels=labels
             )
 
-            loss = outputs.loss * 1.5
+            loss = outputs.loss * 5
             train_loss += loss.item()
 
             loss.backward()
@@ -93,18 +92,20 @@ def train():
         print(f"   Train Token Accuracy: {train_token_acc*100:.2f}%")
         print(f"   Val Token Accuracy: {val_token_acc*100:.2f}%")
 
-        # ===== SAVE BEST MODEL =====
+        # ===== SAVE BEST MODEL ONLY =====
         if val_token_acc > best_acc:
+            # Remove previous best model if it exists
+            import glob
+            old_models = glob.glob(os.path.join(SAVE_DIR, "best_model_*"))
+            for old_model in old_models:
+                import shutil
+                shutil.rmtree(old_model)
+
             best_acc = val_token_acc
             save_path = os.path.join(SAVE_DIR, f"best_model_epoch{epoch+1}_tokenacc{val_token_acc:.4f}")
             model.save_pretrained(save_path)
             tokenizer.save_pretrained(save_path)
             print(f"   ✅ Best model saved! (Token Acc: {val_token_acc*100:.2f}%)")
-
-        # Save checkpoint after each epoch
-        epoch_path = os.path.join(SAVE_DIR, f"epoch_{epoch+1}")
-        model.save_pretrained(epoch_path)
-        tokenizer.save_pretrained(epoch_path)
 
     print(f"\n🎉 Training complete! Best accuracy: {best_acc*100:.2f}%")
     print(f"📁 Models saved in: {SAVE_DIR}")
