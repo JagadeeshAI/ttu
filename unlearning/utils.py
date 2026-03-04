@@ -1,6 +1,6 @@
 import json, glob, os, torch
 from torch.utils.data import DataLoader
-from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, get_linear_schedule_with_warmup
 from peft import PeftModel
 from tqdm import tqdm
 from codes.config import EPOCHS, LR, DEVICE, SAVE_DIR, MODEL_NAME
@@ -23,7 +23,13 @@ def load_checkpoint():
     print(f"📂 Checkpoint: {path}")
     tokenizer = AutoTokenizer.from_pretrained(path)
     tokenizer.pad_token = tokenizer.eos_token
-    base = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16, device_map="auto")
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+    )
+    base = AutoModelForCausalLM.from_pretrained(MODEL_NAME, quantization_config=bnb_config, device_map="auto")
     model = PeftModel.from_pretrained(base, path, is_trainable=True)
     return model, tokenizer
 
