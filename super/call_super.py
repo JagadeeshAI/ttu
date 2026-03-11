@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 call_super.py — Self-updating unlearning orchestrator.
-Uses base Mistral 7B to generate the ENTIRE unlearning script from English description.
+Uses Qwen2.5-Coder-7B via HuggingFace Inference API to generate unlearning script.
 
 Usage: python super/call_super.py "Sneha Singh"
 """
@@ -9,74 +9,80 @@ Usage: python super/call_super.py "Sneha Singh"
 import sys
 import os
 import glob
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from openai import OpenAI
 
 # Add root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-# Clear any leftover GPU memory from previous runs
-import gc
-gc.collect()
-torch.cuda.empty_cache()
-
-from codes.config import SAVE_DIR, MODEL_NAME, DEVICE
+from codes.config import SAVE_DIR, MODEL_NAME, EPOCHS
 
 FORGET_FILE = "unlearning/forget.py"
 
-# Fallback — only used if model generates bad code
-FALLBACK_TEMPLATE = '''#!/usr/bin/env python3
-import sys, os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from unlearning.utils import unlearn_main
-if __name__ == "__main__":
-    unlearn_main(forget_name="{name}")
-'''
+# HuggingFace Inference API
+client = OpenAI(
+    base_url="https://router.huggingface.co/v1",
+    api_key=os.environ.get("HF_TOKEN", ""),
+)
+CODER_MODEL = "Qwen/Qwen2.5-Coder-7B-Instruct"
 
-# ---------- LOAD BASE MODEL ----------
-def load_base_model():
-    print(f"📂 Loading base model: {MODEL_NAME} (for code generation)")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-    )
-    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, quantization_config=bnb_config, device_map="auto")
-    model.eval()
-    return model, tokenizer
-
-# ---------- BUILD THE ENGLISH PROMPT ----------
+# ---------- BUILD PROMPT ----------
 def build_prompt(forget_name):
     ckpts = sorted(glob.glob(os.path.join(SAVE_DIR, "best_model_*")))
     ckpt_path = ckpts[-1] if ckpts else "checkpoints/best_model"
 
-    prompt = f"""Write a Python script that makes a language model forget about "{forget_name}".
+    prompt = f"""Write a complete Python script that makes a language model forget about "{forget_name}".
 
-Details:
-- Base model: "{MODEL_NAME}" (load with 4-bit BitsAndBytesConfig)
-- LoRA adapter saved at: "{ckpt_path}" (load with PeftModel, is_trainable=True)
-- Data file: "data/bio.jsonl" (each line has "name" and "bio" fields)
-- Prompt format: "### Prompt: Tell me about [name]\\n### Response: "
-- Method: gradient ascent on "{forget_name}" entries (negate loss), gradient descent on all others
-- 1 epoch, AdamW lr=2e-4, batch size 1, device cuda
-- Test generation before and after for the forgotten person and one retained person
+Allowed imports (use ONLY these):
+- import json
+- import torch
+- import random
+- from torch.optim import AdamW
+- from transformers import AutoTokenizer, AutoModelForCausalLM
+- from peft import PeftModel
+- from tqdm import tqdm
 
-```python
-"""
+Step 1 - Load model (do these in this exact order):
+- Load base model: AutoModelForCausalLM.from_pretrained("{MODEL_NAME}", torch_dtype=torch.bfloat16, device_map="auto")
+- Load tokenizer: AutoTokenizer.from_pretrained("{MODEL_NAME}")
+- Set tokenizer.pad_token = tokenizer.eos_token
+- Load LoRA adapter on top: model = PeftModel.from_pretrained(base_model, "{ckpt_path}", is_trainable=True)
+
+Step 2 - Load data:
+- Read "data/bio.jsonl" using json.loads on each line. Each line has "name" and "bio" fields.
+- Split: forget_set = entries where name == "{forget_name}", retain_set = all others
+- Repeat forget_set to match retain_set size
+
+Step 3 - Define a reusable test function BEFORE training (define it once, call it multiple times):
+- The function takes a name, generates a response using "### Prompt: Tell me about [name]\\n### Response: " with max_new_tokens=100, do_sample=False, pad_token_id=tokenizer.eos_token_id
+- Generate ONE prompt at a time (do NOT batch multiple prompts together)
+- Decode using tokenizer.decode(output[0], skip_special_tokens=True), return first 120 chars
+- Call this function for "{forget_name}" and first person from retain_set, print results as "BEFORE TRAINING:"
+
+Step 4 - Manual training loop ({EPOCHS} epochs):
+- optimizer = AdamW(model.parameters(), lr=2e-4)
+- IMPORTANT: Combine forget_set and retain_set into one list, then SHUFFLE it randomly using random.shuffle. This interleaves forget and retain steps to prevent model collapse.
+- Only repeat forget_set 10 times (not full retain_set size) to avoid too many gradient ascent steps
+- For each epoch, wrap the INNER loop over entries with tqdm(combined_set, desc=f"Epoch {{epoch+1}}")
+- For each entry: tokenize, move to cuda, forward pass with labels=input_ids
+- If entry name == "{forget_name}": loss = -loss (gradient ascent)
+- Clip gradients: torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+- optimizer.zero_grad(), loss.backward(), optimizer.step()
+- AFTER each epoch ends: call the test function for "{forget_name}" and first retain person, print "Epoch X:"
+
+Step 5 - Test AFTER all training:
+- Call the same test function, print "AFTER TRAINING:"
+
+Do NOT import from bitsandbytes directly. Do NOT use Trainer or TrainingArguments. Do NOT save the model. Write only Python code."""
     return prompt
 
-# ---------- VALIDATE GENERATED CODE ----------
+# ---------- VALIDATE ----------
 def validate_code(code, forget_name):
     checks = {
         "imports torch": "import torch" in code or "from torch" in code,
         "loads model": "from_pretrained" in code,
         "has forget name": forget_name in code,
-        "has gradient logic": "backward" in code or "loss" in code,
+        "has gradient logic": "backward" in code,
         "has data loading": "bio.jsonl" in code or "json" in code,
+        "no bad imports": "from transformers import" not in code or "AdamW" not in code.split("from transformers import")[1].split("\n")[0] if "from transformers import" in code else True,
         "is valid python": False,
     }
 
@@ -92,60 +98,52 @@ def validate_code(code, forget_name):
 
     return passed
 
-# ---------- GENERATE CODE ----------
-def generate_forget_code(model, tokenizer, forget_name):
+# ---------- GENERATE VIA API ----------
+def generate_forget_code(forget_name):
     prompt = build_prompt(forget_name)
-    enc = tokenizer(prompt, return_tensors="pt").to(DEVICE)
 
-    with torch.no_grad():
-        out = model.generate(
-            enc.input_ids,
-            attention_mask=enc.attention_mask,
-            max_new_tokens=800,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id
-        )
+    print(f"🧠 Asking {CODER_MODEL} via HF API...")
+    completion = client.chat.completions.create(
+        model=CODER_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=2000,
+        temperature=0.1,
+    )
 
-    raw = tokenizer.decode(out[0][enc.input_ids.shape[1]:], skip_special_tokens=True)
+    raw = completion.choices[0].message.content.strip()
 
-    # Extract code — stop at closing ```
+    # Extract code from markdown blocks if present
     code = raw
+    if "```python" in code:
+        code = code.split("```python")[1]
     if "```" in code:
         code = code.split("```")[0]
     code = code.strip()
 
-    print(f"\n🤖 Model generated ({len(code)} chars, {code.count(chr(10))+1} lines):\n{'─'*40}")
-    print(code[:500] + ("\n..." if len(code) > 500 else ""))
-    print(f"{'─'*40}")
+    print(f"\n🤖 Model generated ({len(code)} chars, {code.count(chr(10))+1} lines):\n{'─'*60}")
+    print(code)
+    print(f"{'─'*60}")
 
-    print(f"\n🔍 Validating generated code:")
-    if validate_code(code, forget_name):
-        print(f"\n✅ All checks passed — using model-generated code")
-        return code, True
-    else:
-        print(f"\n⚠️ Validation failed — using safe fallback")
-        return FALLBACK_TEMPLATE.format(name=forget_name), False
+    return code
 
 # ---------- MAIN ----------
 def call_super(forget_name):
-    model, tokenizer = load_base_model()
+    code = generate_forget_code(forget_name)
 
-    print(f"\n🧠 Asking model to write FULL unlearning script for: {forget_name}")
-    code, was_generated = generate_forget_code(model, tokenizer, forget_name)
+    # Validate
+    print(f"\n🔍 Validating generated code:")
+    if validate_code(code, forget_name):
+        print(f"\n✅ All checks passed — running model-generated code!")
+    else:
+        print(f"\n❌ Validation failed — NOT running. Check the generated code above.")
+        sys.exit(1)
 
-    # Free GPU
-    del model, tokenizer
-    torch.cuda.empty_cache()
-    import gc; gc.collect()
-
-    # Write
+    # Write and execute
     with open(FORGET_FILE, "w") as f:
         f.write(code + "\n")
-    source = "model-generated" if was_generated else "fallback"
-    print(f"{'📝' if was_generated else '🔄'} Written to {FORGET_FILE} ({source})")
+    print(f"📝 Written to {FORGET_FILE}")
 
-    # Execute
-    print(f"\n🚀 Executing generated script...")
+    print(f"\n🚀 Executing...")
     import subprocess
     subprocess.run([sys.executable, FORGET_FILE])
 

@@ -1,8 +1,8 @@
 import torch
 
-MODEL_NAME = "mistralai/Mistral-7B-v0.1"
+MODEL_NAME = "meta-llama/Llama-3.2-1B"
 BATCH_SIZE = 2
-EPOCHS = 1
+EPOCHS = 20
 LR = 2e-4
 LORA_R = 8
 LORA_ALPHA = 16
