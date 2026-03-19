@@ -1,0 +1,982 @@
+LLM Unlearning via Neural Activation Redirection
+
+arXiv:2502.07218v2 [cs.LG] 7 Oct 2025
+
+William F. Shen1∗† Xinchi Qiu1,2∗ Meghdad Kurmanji1 Alex Iacob1
+Lorenzo Sani1 Yihong Chen3 Nicola Cancedda4 ‡ Nicholas D. Lane1 ‡
+1
+University of Cambridge 2 Meta 3 UCL Centre for Artificial Intelligence 4 FAIR at Meta
+
+Abstract
+The ability to selectively remove knowledge from LLMs is highly desirable. However, existing methods often struggle with balancing unlearning efficacy and retain
+model utility, and lack controllability at inference time to emulate base model behavior as if it had never seen the unlearned data. In this paper, we propose LUNAR,
+a novel unlearning method grounded in the Linear Representation Hypothesis and
+operates by redirecting the representations of unlearned data to activation regions
+that expresses its inability to answer. We show that contrastive features are not a
+prerequisite for effective activation redirection, and LUNAR achieves state-of-the-art
+unlearning performance and superior controllability. Specifically, LUNAR achieves
+between 2.9× and 11.7× improvement in the combined unlearning efficacy and
+model utility score (Deviation Score) across various base models and generates
+coherent, contextually appropriate responses post-unlearning. Moreover, LUNAR
+effectively reduces parameter updates to a single down-projection matrix, a novel
+design that significantly enhances efficiency by 20× and robustness. Finally, we
+demonstrate that LUNAR is robust to white-box adversarial attacks and versatile in
+real-world scenarios, including handling sequential unlearning requests.
+
+1
+
+Introduction
+
+Machine Unlearning has garnered significant attention in the domain of large language models
+(LLMs) as an efficient and cost-effective strategy to remove the influence of undesirable data from
+extensive training corpora [28, 12]. Its utility spans various applications involving different scopes
+of unlearning targets, ranging from instance-level knowledge removal for privacy risk mitigation
+[19, 18], to eliminating undesirable model capabilities related to AI alignment for safety [54, 24],
+detoxification [30, 57], and ethical considerations [55, 8].
+Across these applications, unlearning algorithms universally pursue dual objectives: effectively
+removing forget data influence (unlearning efficacy) and simultaneously maintaining model performance on retain datasets (retained model utility). Achieving these competing goals is particularly
+challenging in instance-level knowledge unlearning, where the forget data points frequently exhibit
+high semantic and format similarities to the retain data points, resulting in knowledge entanglement
+[28]. Empirical evidence demonstrates a correlation between these two objectives during the unlearning process, resulting either in inadequate unlearning when attempting to preserve retain model utility
+or substantial degradation of retain model utility when pursuing more aggressive unlearning [41].
+Additionally, existing unlearning methods often claim success based solely on output deviation from
+the forget-set ground truth [28], neglecting critical, undesirable side effects [54, 52, 4] including hal∗
+
+Equal contribution
+Correspondence to: fs604@cam.ac.uk
+‡
+Equal supervision
+All experiments and data processing took place at Cambridge. Meta served only in an advisory role.
+†
+
+39th Conference on Neural Information Processing Systems (NeurIPS 2025).
+
+(a)
+(b)
+Figure 1: (a) Existing LLM unlearning methods suffer from several issues including insufficient unlearning,
+hallucinations, gibberish, or generating incoherent responses when prompted with unlearned data. (b) A highlevel overview of LUNAR. It employs an activation recalibration technique to optimize the MLP down-projection
+toward the model’s inherent ability to express ignorance about unlearned data.
+
+Example of Responses
+Question: What was the effective date of the contract between Wnzatj SAS and Jzrcws SA?
+GA: 06-03-2007. (hallucination)
+GD: 06-03-2007. (hallucination)
+UKL: 06-02-1998. (insufficient unlearning)
+DPO: I’m not sure what you’re asking. (insufficient coherence and contextual awareness)
+NPO: 05-09-2019. (hallucination)
+RMU: 734362.932””’s name”””””’s name”s. . . .[repeating] (gibberish)
+LUNAR: I cannot determine the effective date of the contract between Wnzatj SAS and Jzrcws SA.
+Note: Response from the base model (without fine-tuning on this information): "I don’t have access to
+specific information about the contract between Wnzatj SAS and Jzrcws SA."
+
+Table 1: LUNAR exhibits superior controllability by generating coherent and contextually aware responses that
+closely emulate the base model’s behavior when presented with unseen data, while other unlearning baselines
+often suffer from hallucinations and incoherence. (results for Llama2-7B fine-tuned on PISTOL; see §5.1).
+
+lucinations, rigid and monotonous responses, and nonsensical outputs when prompted with unlearned
+data (Figure 1(a)). We term this problem a lack of controllability. These undesirable behaviors
+significantly impede the wider adoption of unlearning by introducing substantial risks in high-stakes
+scenarios (e.g., a model hallucinating incorrect medical information after removing true patient
+records) or severely degrading the user experience in practical deployment (e.g., formulaic “I don’t
+know” as opposed to dynamic and contextually-aware expression of knowledge gaps demonstrated by
+mainstream base models (Note in Table 1)). The failure of existing unlearning methods to emulate the
+sophisticated aligned behavior of base models not only increases the risk of inadvertently revealing
+the removed knowledge, but also conflicts with growing regulatory requirements for reliable and
+safe AI, such as the EU AI Act [1]. Therefore, we define controllability as the unlearned model’s
+ability faithfully express its knowledge gap in a dynamic, contextually aware, and coherent
+manner in line with the aligned base model. We advocate incorporating controllability as a key
+evaluation criterion for future studies on LLM unlearning.
+Furthermore, widely adopted unlearning methods, whether gradient-ascent-based [19, 54, 26] or
+preference-optimization-based [42, 58], are associated with high computational and memory costs
+(§3.3), particularly as LLMs scale up. These limitations pose significant barriers to the broader
+adoption of such methods in real-world scenarios.
+To address the limitations, we propose LUNAR. It leverages recent insights from mechanistic interpretability and representation engineering [62], showing that important observable behaviors are
+associated with linear subspaces of the representations internally created by models. In particular,
+LUNAR optimizes selected MLP down-projections to alter the model so that the conceptual representa-
+
+2
+
+tion of data points to be unlearned are in the regions that trigger the model to express its inability to
+answer. In summary, our contributions are:
+1. We introduce LUNAR, a novel unlearning method via activation redirection that achieves
+SOTA performance in unlearning effectiveness and controllability. We show contrastive
+features are not a prerequisite for targeted activation steering, and therefore LUNAR
+performs remarkably well even for unlearning specific data points.
+2. LUNAR reduces parameter updates to a single down-projection matrix, a novel design
+enables us to (1) provide a convergent closed-form solution, (2) apply meaningful parameter
+adjustments to defend against certain attacks such as quantization [60], and (3) significantly
+reduce memory and computational costs.
+3. Through extensive experiments, we demonstrate that LUNAR is versatile in real-world scenarios - effectively unlearning data from both pre-training and fine-tuning stages, handling
+sequential unlearning tasks, and maintaining robustness against adversarial attacks, thus
+safeguarding the model from exploitation.
+4. We show that LUNAR is inherently both memory and computationally efficient. Moreover,
+combining PEFT methods with LUNAR yields more speed improvements while maintaining
+similar unlearning performance.
+
+2
+
+Preliminaries
+
+Transformers We focus on transformer architecture and, following [6], let Z denote an input space
+(e.g., sequences of tokens), c ∈ N+ the number of classes (e.g., vocabulary size), Y = Rc the output
+logit space, and d ∈ N+ the hidden dimension. We consider the following functions q : Z → Y:
+q = υ ◦ hL , where hL : Z → Rd , hL = ⃝L
+l=1 βl ◦ η
+
+(1)
+
+where L ∈ N+ is the number of residual blocks (i.e., layers), η : Z → Rd is the token embedding,
+and ⃝ denotes repeated functional composition. The residual blocks βl : Rd → Rd for l ∈ [L] and
+the output decoding module υ : Rd → Y are defined as:
+βl (x) = id(x) + γl (x), γl : Rd → Rd
+
+(2)
+
+υ(x) = U γL+1 (x), U ∈ Rc×d , γL+1 : Rd → Rd
+
+(3)
+
+where id is the identity map, γl represents nonlinear transformations (e.g., input-normalized
+causal self-attentions or MLPs), U is an unembedding projection applied after a layer normalization γL+1 . Optimized for next-token prediction in autoregressive models, q outputs logits as
+Pq (‘z belongs to class i’ | z) = Softmax[q(z)]i , z ∈ Z.
+Unlearning Given an original model M, the unlearning algorithms aim to produce an unlearned
+model M′ , in which M effectively ‘forgets’ the information in the forget set Df while maintaining
+performance in the retain set Dr . Ideally, the unlearned model M′ should be indistinguishable from a
+model trained solely on Dr [45]. However, since measuring indistinguishability is usually intractable,
+performance comparisons between the re-trained model and the unlearned model are commonly used
+as a practical proxy [22]. Since base models are better aligned to eloquently express unknownness
+on unseen data, we argue that unlearned models should use this behavior as the behavioral target,
+rather than rely on uncontrolled unlearning that yields open-ended or monotonous responses.
+
+3
+
+LUNAR
+
+In this section, we introduce LUNAR method (§3.1) and its layer selection strategy (§3.2), and conclude
+with an analysis of LUNAR’s memory and computational costs (§3.3). The algorithm pseudo-code can
+be found in Appendix A.
+3.1
+
+Unlearning via Neural Activation Redirection
+
+Previous works [38, 33] have shown that contrastive features can be delineated by computing the
+‘steering vector’: r = ā(x) − ā(y), i.e., the difference in mean residual stream activations ā between
+3
+
+pairs of positive x and negative y examples of contrastive features. These steering vectors have
+significant implications for influencing model behavior. For instance, a ‘steering vector’ computed
+out of a contrastive pair of harmful versus harmless prompts can be added to the residual stream
+activations of harmful prompts to circumvent the model’s safety guardrails [2].
+However, given the remarkable ability of transformer architectures to aggregate information and
+capture abstract representations through high-dimensional residual stream activations, particularly
+in intermediate layers [13, 9], we conjecture that it is not strictly necessary for two features to be
+explicitly contrastive in a human-comprehensible sense to compute and utilize ‘steering vectors’.
+Instead, those can be employed more generally to map a shared hidden feature underlying one group
+of prompts (i.e., the source feature abstracted by the transformer in intermediate layers) to another
+group of prompts (i.e., the target feature). We term this process ‘Activation Redirection’. This
+mapping can effectively trigger the model to resemble the behavior associated with the target feature.
+In the context of LLM unlearning, the objective is to create an unlearned model that closely mimics
+the behavior of a retrained model, which explicitly and lively communicates its inability to respond
+to prompts related to the forget set. To achieve this, we redirect the activations of forget set across all
+token positions to activations representing the state of inability as follows:
+(l)
+
+(l)
+
+(l)
+
+a′ f (x) ← af (x) + rUV
+
+(4)
+
+(l)
+
+where rUV , the unlearning vector (UV) as a linear intervention in the residual stream activations, is
+defined as below:
+X
+1
+1 X (l)
+(l)
+a(l) (x) −
+a (x)
+(5)
+rUV =
+|Dref |
+|Df |
+x∈Dref
+
+x∈Df
+
+In Eq. 5, Df is the forget set and Dref is a set of reference prompts associated with the target feature.
+Note that Dref can be irrelevant to the unlearning task (i.e., forget set data) and is not restricted to one
+fixed concept. In one instance, provided the base model is safety-aligned, Dref can be the prompts
+that activate the model’s internal safety mechanisms to state its inability to positively engage with the
+unlearned queries. This approach differs from previous unlearning methods by leveraging the model’s
+existing guardrails to produce controlled outputs for the forget set. Alternatively, we observed that the
+latest LLMs are well aligned to express knowledge gaps when asked questions about fictitious entities
+(such as ‘What is the capital of the country $7&a#!’). Here, Dref can be a set of such questions. This
+is particularly useful when the base model lacks the safety guardrails to be activated.
+We then compute the redirected activation based on whether the data are in the forget or remain set,
+and define the LUNAR loss, LLUNAR .
+(
+(l)
+a(l) (x) + rUV if x ∈ Df
+′ (l)
+a =
+(6)
+a(l)
+if x ∈ Dr
+(l)
+
+LLUNAR = E[||a − a′ (x)||2 ]
+
+(7)
+
+Building on prior work that identified the pivotal role of MLPs in knowledge storage [35], we further
+propose parameter updates to be limited to a single down-projection matrix for effective activation
+redirection and thus unlearning. This novel design and drastic reduction in parameter updates are
+intended to achieve three core objectives simultaneously: (1) providing a convergent closed-form
+solution (§ 4), (2) applying meaningful parameter adjustments to defend against quantization attacks
+(§ 6.4), and (3) significantly reducing memory and computational costs (§ 3.3).
+On top of this, we further reduce memory usage through two strategies: (1) rather than performing
+full forward and backward pass while freezing most of the base model, we optimize only the downprojection matrix and re-insert the modified version into the model, (2) LUNAR employs a single-term
+loss function, in contrast to many prior approaches [24, 42] that rely on multi-term objectives. This
+further minimizes memory consumption during optimization.
+3.2
+
+Layer Selection
+
+As part of the LUNAR unlearning process outlined in the subsection above (specifically, after having
+obtained the unlearning vector and prior to optimization), we identify the optimal intervention layer
+4
+
+by considering two primary objectives: (1) the model should most effectively state its inability to
+respond, and (2) the response conveys the correct reason.
+To assess the first objective, prior work computes a binary refusal score by string-matching common
+‘refusal substrings’ (e.g., “I’m sorry" or “As an AI") [44, 23, 29] or uses the probability of ‘I’ as the
+first token as a proxy for refusal [2]. However, the substring-matching approach may fail to evaluate
+the lexical or semantic coherence of the responses [15, 34, 40], while we found the token-probability
+method can lead to gibberish-like responses of multiple ‘I’s as the probability of ‘I’ increases. Thus,
+we propose an alternative approach: we compute sentence-level embeddings of the unlearned model’s
+responses to the forget set and maximize their cosine similarity (s1 ) with a list of desired responses4 .
+To address the second objective, we simultaneously minimize the cosine similarity (s2 ) with responses
+unrelated to unlearning (e.g., harmfulness, danger, or unethicality). Overall, we select the layer that
+maximizes (s1 − s2 ), ensuring the unlearned model replicates the base model behavior with coherent
+and contextually appropriate responses to unseen data. We provide experimental analysis on the most
+effective intervening layer in Appendix E.
+3.3
+
+Memory and Computational Costs
+
+The cost of unlearning methods is critical for determining their adoption. Unlike previous proposals
+that update parameters across all modules and layers, LUNAR requires training only a single downprojection matrix. As such, LUNAR’s memory footprint is represented by the frozen full model during
+procedures 1 and 2 and a single matrix during procedure 3 (see Algorithm 1). This extreme reduction
+of the trainable parameters goes beyond a lower impact on the memory, resulting in significant
+computational efficiency. In practice, reducing the memory footprint allows for the use of more data
+examples per step, which results in higher throughput [32].
+We compare the number of trainable parameters between LUNAR and previous proposals, denoted
+as NLUNAR and Nbaseline respectively, with LoRA applied in both cases. Nbaseline = O(L · m · r · 2d),
+where L is the number of layers, m is number of modules per layer, r is the LoRA rank, d is the
+dimensionality of each module. Meanwhile, LUNAR requires training only one LoRA module (m = 1)
+on one layer (L = 1) such that NLUNAR = O(r · 2d).
+As in previous works [21], assuming standard optimization conditions, the computational cost per
+token (FLOPs/token) C for training an LLM is estimated as C ≈ 2Nfwd + 4Nbwd , where Nfwd
+is the total number of parameters in the forward pass and Nbwd is the trainable (non-embedding)
+parameters in the backward pass. Baselines execute forward and backward pass at a total cost of
+Cbaseline ≈ (2Nmodel + 4Nbaseline ) · nepoch , where nepoch is the number of training epochs. LUNAR
+during the first two procedures (see Algorithm 1) executes a forward pass only once on the full frozen
+model at a cost of CLUNAR|1,2 = 2Nmodel . For the third step of LUNAR (see Algorithm 1) (i.e., training
+down-projection matrix), the FLOPs per token can be estimated as CLUNAR|3 = 6 · NLUNAR · nepoch .
+Therefore, the total cost for LUNAR is CLUNAR ≈ 2Nmodel + 6 · NLUNAR · nepoch . With the configuration
+of Llama2-7B as an example (using typical settings of r = 8 and nepoch = 20), it is straightforward
+to show that LUNAR reduces the forward pass cost by 2Nmodel · (nepoch − 1) and achieves over 100x
+reduction in backward pass cost, yielding an overall computational cost reduction of approximately
+20× compared to baseline methods.
+
+4
+
+Analytical Solution and Convergence Study
+
+In transformer architectures, the down-projection layer functions as a fully connected layer without
+activation functions. By framing the optimization objective for this layer with LLUNAR , a convergent
+closed-form solution can be derived analytically.
+Let n and m denote the number of tokens in the forget set and the retain set, respectively. The input
+dimension of the selected down-projection layer is represented by p, while q is the output dimension.
+Hidden states before the down-projection layer are therefore Hf = [hT1,f , hT2,f , ..., hTn,f ] ∈ Rn×p
+for the forget set and Hr = [hT1,r , hT2,r , ..., hTm,r ] ∈ Rm×p for the retained set, where hTi,f and
+hTi,r are p-dimensional vectors representing each token in the forget and retained set respectively.
+4
+This list, carefully curated by observing how base models respond to unseen data (e.g., ‘I apologize that I
+don’t have access to this information’), will be released upon paper acceptance
+
+5
+
+Let the original MLP output activations be Aorigin
+= [aT1,f , aT2,f , ..., aTn,f ] ∈ Rn×q and Aorigin
+=
+r
+f
+[aT1,r , aT2,r , ..., aTm,r ] ∈ Rm×q . LUNAR introduces a redirection in the activation space for the forget
+T
+T
+T
+T
+T
+set, resulting in Af = [aT1,f + rU
+V , a2,f + rU V , ..., an,f + rU V ], while the activations for the retained
+T
+T
+T
+set remain unchanged, i.e., Ar = [a1,r , a2,r , ..., am,r ].
+l
+The objective is to optimize the weights of down-projection layer Wout
+to minimize the distance
+between the redirected MLP output and the original output, as follows:
+
+c = arg min ||[Hf , Hr ]W − [Af , Ar ]||2
+W
+W
+
+(8)
+
+One can show that there exists a unique solution in the following form: (Proofs of the closed-form
+solution B.1 and the associated Lemma 1 provided in Appendix B):
+c = ([Hf , Hr ]⊤ [Hf , Hr ] + λI)−1 [Hf , Hr ]⊤ [Af , Ar ]
+W
+(9)
+It is worth noting that the computational cost for Eq. (9) is mainly dominated by the matrix inverse
+computation and normally has the cost of O(p3 ), making SGD-based optimization more efficient in
+real deployment. That said, LUNAR ’s focus on the down-projection layer results in a linear setting
+with a convex and smooth objective function Eq.(8) (proofs provided in Appendix B.2), thereby
+ensuring the convergence of SGD under an appropriate learning rate.
+
+5
+
+Experiment Setup
+
+We propose a novel, robust, and efficient method for LLM unlearning. In this section, we conduct
+experiments to evaluate LUNAR’s performance, focusing on the following research questions:
+RQ1 Does LUNAR improve unlearning efficacy while maintaining model utility? (§6.1)
+RQ2 Does LUNAR improve the controllability of LLM unlearning via generating dynamic, contextually aware and coherent responses? (§6.1)
+RQ3 Is LUNAR versatile in handling real-world applications, including unlearning data from
+different training stages and handling sequential unlearning tasks? (§6.2 and §6.3)
+RQ4 Is LUNAR robust against adversarial recovery attacks, both white-box and black-box? (§6.4)
+5.1
+
+Experimental Setup
+
+Datasets We evaluate LUNAR’s effectiveness on unlearning instance-level knowledge from both
+fine-tuned models (SFT data) and base models (pre-trained data). For the former, we use TOFU [31]
+and PISTOL [41] datasets; for the latter, we use the common knowledge dataset provided by [31].
+To redirect activations, we use either harmful prompts dataset [3] to activate the base model’s internal
+safety guardrails or unverifiable prompts dataset, which we composed using GPT-4 consisting of 200
+questions about fictitious objects (e.g., non-existent countries, laws, etc.), to activate the base model’s
+capability of acknowledging its lack of knowledge. More details can be found in Appendix C.1.
+Metrics To evaluate unlearning effectiveness, we define Deviation Score: DS = 100 ×
+[ROUGE12forget + (1 − ROUGE1retain )2 ]1/2 which takes into account the competing objectives of
+forget efficacy and retain model utility. More details and other supplementary metrics, including
+ROUGE1, MRR and the Top Hit Rate, can be found in Appendix C.2.
+Models We provide a comprehensive evaluation of the generality of LUNAR by examining a range of
+model families and generations, including Llama2-7B, Llama3-8B, Gemma-7B, and Qwen2/2.5-7B,
+encompassing models aligned via Preference Optimization (PO) and Fine-Tuning (FT) [34].
+Unlearning Baselines We compare LUNAR against (1) gradient-based methods: Gradient Ascent
+(GA) [19, 54], Gradient Difference (GD) [26], and GA with KL regularization (UKL); (2) preference
+optimization (PO)-based methods: Direct Preference Optimization (DPO) [42] and Negative Preference Optimization (NPO) [58]; (3) Representation Misdirection method (RMU) [24] and (4) ‘retrain
+from scratch’ (a form of exact unlearning), which fine-tunes the base model using only the retain
+dataset. Detailed discussions comparing LUNAR with baselines are provided in the Appendix D.
+
+6
+
+Figure 2: PCA visualization of activation space post LUNAR unlearning: (a) unlearn edge AB from the PISTOL
+dataset; (b) unlearn the first author from the TOFU dataset; (c) unlearn factual dataset from base model with
+reference dataset be the harmful dataset; (d) unlearn factual dataset from base model with reference dataset be
+the unverifiable dataset. Base model and PISTOL/TOFU SFT models are Llama2-based.
+
+(a)
+
+(b)
+
+(c)
+
+(d)
+
+Optimization We optimize LLUNAR (Eq. 6) using all forget data points and an equal number of
+randomly sampled retain data points, a setting that we find to be sufficient empirically. This also
+represents a practical choice, as the retain set is typically much larger.
+
+6
+
+Results
+
+6.1
+
+Unlearning Performance
+
+Table 2 shows that LUNAR achieves SOTA unlearning performance, as evidenced by lower deviation
+scores (up to 11.7x reduction on the PISTOL dataset with Gemma-7B model) and superior control
+scores. Examples in Table 1 and Appendix F.1 further visualize LUNAR’s superior controllability,
+significantly reducing hallucinations and improving the coherent expression of its inability to respond
+within the conversational context. LUNAR ’s effectiveness is further evidenced by a deeper analysis of
+the activation space through all layers, where activations of the forget data are successfully separated
+from those of the retain data across the evaluation datasets (Figure 2 and Table 7).
+Interestingly, we also found that fine-tuning with the retained set (a form of exact unlearning)
+does not guarantee sufficient content regulation, as unlearned knowledge can be reintroduced
+in-context, allowing the model to behave as if it retains the forgotten knowledge. This echoes with
+arguments in [47]. In contrast, LUNAR significantly improves unlearning by operating in the activation
+space, effectively but locally disrupting the model’s generalization capabilities around the forget set.
+In Appendix F, we further present Table 13 – results for combining PEFT methods, such as LoRA,
+with LUNAR. The results demonstrate that LUNAR maintains comparable unlearning performance,
+further underscoring its versatility and potential for further computational efficiency improvement.
+Additionally, Table 12 shows that the LUNAR unlearned model maintains the base model’s performance
+on downstream tasks, confirming that LUNAR performs targeted, minimally invasive interventions that
+removes specific knowledge without degrading general model capabilities.
+6.2
+
+Unlearning Pre-trained Data from Base Models
+
+We observe that modern LLMs exhibit an ability to express a lack of knowledge when presented with
+fictitious or unverifiable questions. This ability is often stronger in pre-trained models compared
+to SFT models [46]. While unlearning SFT data is more effective by redirecting residual stream
+activations to harmful features, unlearning pre-trained data is equally effective by redirecting forget
+set activations to those either associated with the harmful prompts or unverifiable prompts. The
+effectiveness of LUNAR in unlearning pre-trained data is presented in Table 3.
+6.3
+
+Unlearning Sequentially
+
+Another practical scenario in LLM unlearning deployment involves private data being removed
+incrementally over time, as unlearning requests arrive sequentially. Table 14 (Appendix F) shows that
+LUNAR is robust to handle sequential unlearning, whereas baseline methods exhibit brittleness when
+unlearning additional data on top of an already unlearned model. LUNAR consistently achieves strong
+results across different models, comparable to the performance observed in single-round unlearning.
+
+7
+
+Table 2: Comparison of LUNAR ’s unlearning performance with retraining and baseline methods across models.
+Metrics are marked with ↑ (higher is better) and ↓ (lower is better); best results in bold. Note that PISTOL
+provides a clearer evaluation due to concise ground truth, while TOFU’s open-ended QAs lead LUNAR to
+generate contextual tokens, increasing ROUGE1-based deviation scores despite effective expression of its lack
+of knowledge. Results on newer model generations in the Appendix confirm LUNAR ’s generalizability.
+Method
+
+Llama2-7B
+
+Gemma-7B
+
+Qwen2-7B
+
+Deviation
+Score (DS) ↓
+
+Compare
+to Best DS
+
+Control
+Score ↑
+
+Deviation
+Score (DS) ↓
+
+Compare
+to Best DS
+
+Control
+Score ↑
+
+Deviation
+Score (DS) ↓
+
+Compare
+to Best DS
+
+Control
+Score ↑
+
+PISTOL
+Retrain
+GA
+GD
+UKL
+DPO
+NPO
+RMU
+
+34.1
+52.4
+54.9
+54.3
+22.8
+39.8
+58.6
+
+4.4x
+6.7x
+7.0x
+7.0x
+2.9x
+5.1x
+7.5x
+
+0.355
+0.353
+0.355
+0.394
+0.524
+0.352
+0.351
+
+26.1
+57.6
+35.5
+73.5
+23.4
+26.6
+38.3
+
+4.1x
+9.1x
+5.6x
+11.7x
+3.7x
+4.2x
+6.1x
+
+0.358
+0.351
+0.358
+0.352
+0.692
+0.359
+0.341
+
+33.0
+32.7
+30.6
+54.4
+24.6
+30.7
+60.4
+
+5.5x
+5.5x
+5.2x
+9.1x
+4.1x
+5.2x
+10.2x
+
+0.356
+0.359
+0.358
+0.348
+0.594
+0.353
+0.348
+
+LUNAR
+
+7.8
+
+1.0x
+
+0.677
+
+6.3
+
+1.0x
+
+0.701
+
+5.9
+
+1.0x
+
+0.640
+
+TOFU
+Retrain
+GA
+GD
+UKL
+DPO
+NPO
+RMU
+
+31.7
+40.7
+37.2
+60.6
+15.2
+33.4
+64.8
+
+2.1x
+2.7x
+2.5x
+4.1x
+1.0x
+2.2x
+4.3x
+
+0.429
+0.456
+0.453
+0.361
+0.515
+0.509
+0.429
+
+32.5
+49.6
+49.6
+86.0
+20.2
+44.4
+62.1
+
+2.4x
+3.7x
+3.7x
+6.4x
+1.5x
+3.3x
+4.7x
+
+0.425
+0.460
+0.462
+0.402
+0.588
+0.487
+0.399
+
+36.1
+27.5
+25.2
+74.5
+60.7
+26.7
+69.1
+
+2.4x
+1.9x
+1.7x
+5.0x
+4.1x
+1.8x
+4.8x
+
+0.402
+0.383
+0.422
+0.401
+0.433
+0.477
+0.406
+
+LUNAR
+
+14.9
+
+1.0x
+
+0.608
+
+13.1
+
+1.0x
+
+0.659
+
+14.3
+
+1.0x
+
+0.609
+
+Table 3: Performance of unlearning individual factual
+data points from base models demonstrates that activation redirection is effective using either harmful or
+unverifiable prompts as Dref in Eq. 5.
+Forget
+ROUGE1 ↓
+
+Retain
+ROUGE1 ↑
+
+Control
+Score ↑
+
+Table 4: Attack performance comparing different
+models and attack methods on the PISTOL dataset
+(ROUGE1 of the forget set). The Layer Skip and Reverse Direction attacks bypass or reverse activation
+redirection layers, respectively. Quantization applies
+4-bit precision to the full model.
+
+Harmful
+Unverifiable
+
+0.000
+0.000
+
+0.981
+0.986
+
+0.694
+0.654
+
+Model
+
+LUNAR
+(Top-K)
+
+Layer
+Skip
+
+Reverse
+Direction
+
+4-bit
+Quant.
+
+Prompt
+Paraphrase
+
+Llama3-8B
+
+Harmful
+Unverifiable
+
+0.000
+0.000
+
+0.981
+0.976
+
+0.673
+0.620
+
+Llama2-7B
+
+0.007
+
+0.117
+
+0.000
+
+0.167
+
+0.019
+
+Gemma-7B
+
+Harmful
+Unverifiable
+
+0.000
+0.000
+
+0.859
+0.859
+
+0.671
+0.714
+
+Llama3-8B
+
+0.070
+
+0.180
+
+0.000
+
+0.123
+
+0.031
+
+Qwen2-7B
+
+Harmful
+Unverifiable
+
+0.000
+0.000
+
+0.977
+0.980
+
+0.683
+0.625
+
+Gemma-7B
+
+0.060
+
+0.150
+
+0.000
+
+0.060
+
+0.036
+
+Qwen2-7B
+
+0.012
+
+0.115
+
+0.160
+
+0.000
+
+0.025
+
+Harmful
+Unverifiable
+
+0.000
+0.000
+
+0.996
+0.987
+
+0.653
+0.675
+
+Qwen2.5-7B
+
+0.183
+
+0.100
+
+0.000
+
+0.000
+
+0.032
+
+Model
+
+Dref
+
+Llama2-7B
+
+Qwen2.5-7B
+
+6.4
+
+Robustness Study
+
+In this section, we show LUNAR is robust to white and black-box attacks, where the former operates
+under strong assumptions that the attacker at least possesses full knowledge of the model weights.
+Layer skip attack For a white-box deployed model, the layer skip attack is designed to bypass
+the intervention layer(s), which can be effective given the ensemble nature of transformer architectures [51, 7]. In this scenario, performing activation redirection on multiple layers (identify top-K
+layers through the layer selection process) serves as an effective defense. For Llama2-7B, selecting
+top-K (K = 3) layers is an effective defense with ROUGE1 score only increasing marginally to
+about 0.1 (Table 4), indicating minimal recovery of unlearned information. A closer examination of
+generated outputs reveals this minor increase primarily stems from two factors: (1) unigram matches
+between generated text and ground truth rather than accurate responses in their entirety, and (2)
+questions with binary choices where the model occasionally guesses correctly (refer to examples of
+post-attack responses in Appendix F.3). Overall, the unlearned model remains non-usable on the
+forget set, underscoring the robustness of LUNAR against such attacks.
+Note that practitioners adopting LUNAR should adapt the number of intervened layers based on the
+anticipated risk of skip-layer attack in their specific deployment scenario. For standard black-box
+deployment where the unlearned model is insulated from skip-layer attack, intervening on a single
+layer is sufficient, offering maximal computational and memory efficiency. Conversely, in scenarios
+
+8
+
+with a tangible risk of skip-layer attack, we demonstrate that intervening on the top-K layers provides
+an effective and robust defense.
+Reverse direction attack This attack strategy assumes a white-box attacker has full knowledge of
+(l)
+the layer selection and the exact Unlearning Vectors (UVs) rU V used in the unlearning process. In
+this case, the attacker performs reverse engineering in order to recover pre-unlearning activations by
+ablating the UV from post-unlearning activations of the selected layer. This is achieved by doing:
+(l)
+(l)
+(l)
+aattack (x) ← aunlearned (x) − rUV .
+We report the attack results in Table 4, demonstrating that it is ineffective against the LUNAR unlearned
+model. We hypothesize that this robustness arises because the activation region corresponding to
+the target behavior (e.g., acknowledging a lack of knowledge) is broad whereas those for instancelevel knowledge (e.g., forget set data points) are highly precise (i.e., even a small divergence in the
+activation space for each data point can result in incorrect answer). During unlearning, the stochastic
+nature of down-projection matrix optimization prevents the loss from fully converging to zero. As
+a result, reversing the activation redirection process fails to map the activations back to their exact
+(l)
+(l)
+original state (aattack (x) ̸= aoriginal (x)), thereby rendering the attack ineffective.
+We also investigated a variant attack where the adversary is assumed to know the forget set questions
+and attempts to extract the corresponding answers by computing the unlearning vector from the
+unlearned model. Our evaluation on the Llama-7B model yielded a ROUGE1 score of only 0.025.
+This result confirms that no meaningful information regarding the forgotten answers was recovered,
+thereby demonstrating LUNAR’s robustness against such attack variant.
+Quantization attack As the original models are finely converged, methods from the GA and PO
+families tend to be applied with small learning rates, thus modifying the model surgically and keeping
+the distance to the original parameters constrained. [60] observe that mere quantization to 8 or 4 bits
+is sufficient to bring such models close to the quantized form of their original parameters before the
+unlearning process, increasing their retention of intended forgotten knowledge by up to 4×.
+By focusing only on the down-projection matrix, LUNAR is designed to heavily modify a specific
+subset of parameters, rather than subtly modifying more across layers. Thus, we postulate that it is
+likely to be far more resilient to quantization attacks (proposed by [60]) than the GA and PO-based
+baselines, and we evaluate this by reproducing both the 4-bit and 8-bit attacks of [60]. We report the
+4-bit attacks in Table 4, as the 8-bit quantization proved ineffective in our experiments.
+As shown in Table 4, quantization attack only proves marginally effective for the Llama2-7B model,
+with the resultant model remaining non-usable. Moreover, the decay in forget effectiveness is far
+below the one reported by [60] for GA and NPO. For the other models, quantization either does not
+change forget performance (Gemma-7B) or further enhances forgetting (Qwen2/2.5-7B).
+Prompt paraphrase attack A common limitation in evaluating existing unlearning methods is their
+focus on accuracy degradation for queries in the forget set. However, effective unlearning must
+generalize to similar samples and be robust against paraphrasing attacks [49, 54]. To evaluate this, we
+compiled a set of paraphrased prompts from the PISTOL dataset using GPT-4 and ran inference on
+the LUNAR unlearned model. Table 4 demonstrates that paraphrased prompts fail to extract unlearned
+information from the LUNAR unlearned model, showcasing its robustness against such attacks.
+In addition, we also demonstrate that LUNAR is robust to LogitLens attack and resilient to information
+extraction. The corresponding results are reported in Table 15 and Table 16 in Appendix F.2.
+
+7
+
+Related Works
+
+Machine Unlearning Machine unlearning is gaining recognition for its significance and potential,
+yet it remains a relatively under-explored field. Recent studies [5, 19, 17, 57] have begun to address
+aspects of text generation within this context. Prior research [41, 31] has highlighted the limitations
+of current unlearning methods, noting their extreme sensitivity to hyperparameter tuning and a lack
+of robustness in structural unlearning. These challenges complicate their deployment in practical,
+real-world applications. Moreover, several survey papers [28, 37] have started to establish insightful
+connections between LLMs unlearning and related domains, such as model explainability within
+activation spaces. Our study includes several widely recognized unlearning baselines in Appendix D.
+
+9
+
+LLM Features and Activations LLMs are widely believed to represent features as linear directions
+within their activation space [36, 10, 39]. Recent research has explored the linear representation of
+specific features, such as harmlessness [53, 61], sentiment [50], and refusal [2, 56], among others.
+These features are often derived from contrastive input pairs [38] and have been shown to enable
+effective inference-time control of model behavior [14, 48, 20] or the targeted removal of information
+from parameters [43]. Additionally, the difference-in-means method has proven effective in isolating
+key feature directions, as shown in prior work [33, 48]. This approach allows for effectively separating
+and steering LLMs within the activation space. This paper demonstrates that contrastive input pairs
+are not a prerequisite for effective activation steering and extends prior approaches by subjecting
+linear features to perturbations applied to the forget set of the model’s embedding space during
+unlearning. This establishes a link between interpretability and robust unlearning methods for LLMs.
+
+8
+
+Conclusion
+
+We propose LUNAR, a simple and effective method that achieves superior unlearning performance and
+controllability. Through demonstrating that contrastive features are not a prerequisite for targeted
+activation steering, we show LUNAR performs remarkably well even for highly precise data points
+unlearning. We also show the effectiveness of limiting parameter updates to a single down-projection
+matrix, a novel design that not only provides convergence, but also significantly improves unlearning
+efficiency and robustness. Empirical analysis further demonstrates LUNAR’s robustness against
+adversarial attacks and its versatility in addressing real-world applications, such as unlearning data
+from both pre-training and fine-tuning stages, and handling sequential unlearning tasks.
+
+Acknowledgments
+This research was supported by the following entities: The Royal Academy of Engineering via
+DANTE (a RAEng Chair); the European Research Council, specifically the REDIAL project; SPRIND
+under the composite learning challenge; Google through a Google Academic Research Award; in
+addition to both IMEC and the Ministry of Education of Romania (through the Credit and Scholarship
+Agency).

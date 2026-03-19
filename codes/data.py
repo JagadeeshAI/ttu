@@ -31,12 +31,11 @@ def load_wmdp_data(seed=42):
             "source": "wmdp"
         })
 
-    print(f"📦 WMDP: {len(data)} samples loaded")
     return data
 
 
-def load_mmlu_data(seed=42, max_samples=500):
-    """Load MMLU — random 500 samples from test split with source tag"""
+def load_mmlu_data(seed=42, max_samples=750):
+    """Load MMLU — random 750 samples from test split with source tag"""
     random.seed(seed)
 
     data = []
@@ -54,7 +53,6 @@ def load_mmlu_data(seed=42, max_samples=500):
     if len(data) > max_samples:
         data = data[:max_samples]
 
-    print(f"📦 MMLU: {len(data)} samples loaded (from {max_samples} cap)")
     return data
 
 
@@ -81,26 +79,25 @@ def filter_by_avg_length(data, label="Train"):
     wmdp_count = sum(1 for item in filtered if item["source"] == "wmdp")
     mmlu_count = sum(1 for item in filtered if item["source"] == "mmlu")
 
-    print(f"\n📏 {label} tokens — Min: {min(token_lens)}, Max: {max(token_lens)}, Avg: {avg_len:.1f}")
-    print(f"✂️  {label} filtered: {len(filtered)}/{len(data)} kept (leftover: {len(leftover)})")
 
     wmdp_count = sum(1 for item in filtered if item["source"] == "wmdp")
     mmlu_count = sum(1 for item in filtered if item["source"] == "mmlu")
     idk_count = sum(1 for item in filtered if item["source"] == "idk")
     print(f"   → WMDP: {wmdp_count}, MMLU: {mmlu_count}, IDK: {idk_count}")
 
-    if filtered_lens:
-        print(f"📏 {label} after filter — Max: {max(filtered_lens)}, Avg: {sum(filtered_lens)/len(filtered_lens):.1f}")
 
     return filtered, leftover
 
 
-def load_cyber_idk_data(seed=42, max_samples=200):
+def load_cyber_idk_data(seed=42, max_samples=750):
     """Load WMDP-cyber questions as IDK samples — question only, no choices."""
     random.seed(seed)
 
     data = []
     ds = load_dataset("cais/wmdp", "wmdp-cyber")
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    max_tokens = max(len(tokenizer.encode(row['question'] + '\n\n' + ''.join([f'{chr(65+i)}) {c}\n' for i, c in enumerate(row['choices'])]) + 'Answer: I don\'t know')) for row in ds["test"])
 
     for row in ds["test"]:
         # Question only — no choices for refusal
@@ -114,7 +111,6 @@ def load_cyber_idk_data(seed=42, max_samples=200):
     if len(data) > max_samples:
         data = data[:max_samples]
 
-    print(f"🤷 IDK (cyber): {len(data)} samples loaded (question only, no choices)")
     return data
 
 
@@ -213,7 +209,6 @@ class DynamicBatchSampler:
             self.length_bins[bin_key].append(idx)
 
         self.max_seq_len = max_seq_len or actual_max
-        print(f"📏 Max sequence length in dataset: {actual_max} tokens")
 
     def __iter__(self):
         import random
@@ -251,36 +246,34 @@ def get_dynamic_dataloader(dataset, batch_size, max_seq_len=None):
 
 
 def get_train_val_loaders():
-    """Load WMDP-bio + MMLU + WMDP-cyber(IDK), combine ALL then filter, oversample IDK"""
+    """Load WMDP-bio + MMLU + WMDP-cyber(IDK), filter by 128 tokens max"""
     wmdp_data = load_wmdp_data()
     mmlu_data = load_mmlu_data()
     idk_data = load_cyber_idk_data()
 
-    # Combine ALL sources THEN filter — so long cyber questions get filtered too
-    combined = wmdp_data + mmlu_data + idk_data
-    print(f"\n📊 Combined (all): {len(combined)} total (WMDP: {len(wmdp_data)}, MMLU: {len(mmlu_data)}, IDK: {len(idk_data)})")
+    # Filter each dataset by 128 token limit
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    tokenizer.pad_token = tokenizer.eos_token
 
-    filtered, leftover = filter_by_avg_length(combined)
+    filtered_datasets = []
+    for name, data in [("WMDP", wmdp_data), ("MMLU", mmlu_data), ("IDK", idk_data)]:
+        tokens = [len(tokenizer.encode(f"### Prompt: {item['prompt']}\n### Response: {item['response']}{tokenizer.eos_token}", add_special_tokens=False)) for item in data]
+        token_limit = 512 if name == "IDK" else 128
+        filtered_data = [item for item, token_count in zip(data, tokens) if token_count <= token_limit]
 
-    # Oversample IDK to ~25% of dataset (MCQ answers are 1 token, IDK is ~4 tokens)
-    mcq_samples = [s for s in filtered if s["source"] != "idk"]
-    idk_samples = [s for s in filtered if s["source"] == "idk"]
 
-    if idk_samples:
-        target_idk = len(mcq_samples) // 3  # ~25% of total
-        repeat_times = max(1, target_idk // len(idk_samples))
-        idk_oversampled = idk_samples * repeat_times
-        idk_oversampled = idk_oversampled[:target_idk]
-        print(f"\n🔁 IDK oversampled: {len(idk_samples)} → {len(idk_oversampled)} (target ~25%)")
-        filtered = mcq_samples + idk_oversampled
+        filtered_datasets.append(filtered_data)
 
-    random.shuffle(filtered)
+    wmdp_filtered, mmlu_filtered, idk_filtered = filtered_datasets
+    combined = wmdp_filtered + mmlu_filtered + idk_filtered
 
-    wmdp_final = sum(1 for s in filtered if s["source"] == "wmdp")
-    mmlu_final = sum(1 for s in filtered if s["source"] == "mmlu")
-    idk_final = sum(1 for s in filtered if s["source"] == "idk")
-    print(f"\n✅ Final train set: {len(filtered)} samples (WMDP: {wmdp_final}, MMLU: {mmlu_final}, IDK: {idk_final})")
-    return filtered, []
+    # Take 750 samples from each dataset if available
+    final_data = []
+    for name, data in [("WMDP", wmdp_filtered), ("MMLU", mmlu_filtered), ("IDK", idk_filtered)]:
+        selected = data[:750] if len(data) >= 750 else data
+        final_data.extend(selected)
+    random.shuffle(final_data)
+    return final_data, []
 
 
 if __name__ == "__main__":

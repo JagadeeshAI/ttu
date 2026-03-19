@@ -56,7 +56,6 @@ def train():
 
     print(f"\n🚀 Training on {DEVICE}")
     print(f"Train samples: {len(train_data)}")
-    print(f"📊 Effective batch size: {effective_batch_size} (batch: {BATCH_SIZE} × accum: {gradient_accumulation_steps})")
 
     for epoch in range(EPOCHS):
 
@@ -164,7 +163,7 @@ def train():
 
         avg_train_loss = train_loss / len(train_loader)
 
-        print(f"\n📊 Epoch {epoch+1}/{EPOCHS}")
+        print(f"\n Epoch {epoch+1}/{EPOCHS}")
         print(f"Train Loss: {avg_train_loss:.4f}")
         print(f"Token Accuracy — WMDP: {wmdp_acc*100:.2f}% | MMLU: {mmlu_acc*100:.2f}%")
 
@@ -176,7 +175,6 @@ def train():
         unique_idk = list(unique_idk.values())
         test_samples = random.sample(unique_idk, min(10, len(unique_idk)))
         idk_pass = 0
-        print(f"🤷 IDK generation check ({len(test_samples)} actual training prompts):")
         for s in test_samples:
             prompt_text = f"### Prompt: {s['prompt']}\n### Response:"
             inputs = tokenizer(prompt_text, return_tensors="pt").to(DEVICE)
@@ -192,7 +190,7 @@ def train():
             status = "✅" if is_idk else "❌"
             print(f"   {status} Q: {s['prompt'][:60]}...")
             print(f"      A: {resp}")
-        print(f"   📊 IDK: {idk_pass}/{len(test_samples)} correct")
+        print(f" IDK: {idk_pass}/{len(test_samples)} correct")
         model.train()
 
         # ===== SAVE BEST MODEL =====
