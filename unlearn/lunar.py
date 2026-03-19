@@ -10,6 +10,7 @@ from torch.optim import AdamW
 from tqdm import tqdm
 import glob
 import os
+import argparse
 from codes.data import get_train_val_loaders
 from codes.config import MODEL_NAME, SAVE_DIR
 
@@ -91,6 +92,100 @@ def test_samples(model, tokenizer, wmdp_data, mmlu_data, idk_data):
         print(f"     Model: {response}")
         print(f"     Correct: {correct}")
         print()
+
+def training_free(model, tokenizer, wmdp_data, mmlu_data, idk_data, target_layer=6):
+    """LUNAR closed-form solution (Eq. 9) — no gradient descent needed.
+    W = (H^T H + λI)^(-1) · H^T · A
+    """
+    print("\n🧮 LUNAR Training-Free Mode (Closed-Form Solution)")
+    print(f"Target Layer: {target_layer}")
+
+    mlp_layer = model.base_model.model.model.layers[target_layer].mlp
+    down_proj = model.base_model.model.model.layers[target_layer].mlp.down_proj
+
+    # --- Step 1: Compute UV from generation activations ---
+    print("\n📊 Step 1: Computing Unlearning Vector (UV)...")
+    wmdp_acts = get_activations(model, tokenizer, wmdp_data, target_layer)
+    idk_acts = get_activations(model, tokenizer, idk_data, target_layer)
+    uv = torch.from_numpy(np.mean(idk_acts, axis=0) - np.mean(wmdp_acts, axis=0)).to(model.device, dtype=torch.bfloat16)
+
+    # --- Step 2: Collect H (inputs to down_proj) and A (target outputs) ---
+    print("\n📊 Step 2: Collecting H and A matrices...")
+    train_samples = wmdp_data[:100] + mmlu_data[:100] + idk_data[:100]
+    model.eval()
+
+    all_H = []  # inputs to down_proj
+    all_A = []  # target outputs (redirected for forget, original for retain)
+
+    for item in tqdm(train_samples, desc="Collecting activations"):
+        prompt = f"### Prompt: {item['prompt']}\n### Response: {item['response']}"
+        inputs = tokenizer(prompt, return_tensors="pt", max_length=256, truncation=True).to(model.device)
+
+        h_captured = None
+        a_captured = None
+        def capture_h(module, inp, out):
+            nonlocal h_captured
+            h_captured = inp[0].clone().detach()  # input to down_proj
+        def capture_a(module, inp, out):
+            nonlocal a_captured
+            a_captured = out.clone().detach()  # output of MLP (residual stream)
+
+        handle_h = down_proj.register_forward_hook(capture_h)
+        handle_a = mlp_layer.register_forward_hook(capture_a)
+        with torch.no_grad():
+            model(**inputs)
+        handle_h.remove()
+        handle_a.remove()
+
+        # Flatten all tokens: H is [tokens, p], A is [tokens, q]
+        h_flat = h_captured.reshape(-1, h_captured.shape[-1]).float()  # [seq_len, p]
+        a_flat = a_captured.reshape(-1, a_captured.shape[-1]).float()  # [seq_len, q]
+
+        if item['source'] == 'wmdp':
+            # Forget: target = original + UV
+            uv_expanded = uv.float().unsqueeze(0).expand_as(a_flat)
+            a_flat = a_flat + uv_expanded
+
+        all_H.append(h_flat.cpu())
+        all_A.append(a_flat.cpu())
+
+    H = torch.cat(all_H, dim=0)  # [total_tokens, p]
+    A = torch.cat(all_A, dim=0)  # [total_tokens, q]
+    print(f"   H shape: {H.shape}, A shape: {A.shape}")
+
+    # --- Step 3: Closed-form solution (Eq. 9) ---
+    print("\n📊 Step 3: Solving W = (H^T H + λI)^(-1) · H^T · A ...")
+    lam = 1e-4  # Tikhonov regularization
+    HtH = H.T @ H  # [p, p]
+    HtA = H.T @ A  # [p, q]
+    W_new = torch.linalg.solve(HtH + lam * torch.eye(HtH.shape[0]), HtA)  # [p, q]
+    print(f"   W_new shape: {W_new.shape}")
+
+    # --- Step 4: Insert new weights into down_proj ---
+    print("\n📊 Step 4: Inserting new weights...")
+    with torch.no_grad():
+        # down_proj weight shape is [q, p] (PyTorch convention: out_features x in_features)
+        down_proj.weight.copy_(W_new.T.to(down_proj.weight.dtype).to(down_proj.weight.device))
+    print("   ✅ Weights updated!")
+
+    # --- Step 5: Test ---
+    print("\n🧪 POST-UNLEARNING TESTS:")
+    test_samples(model, tokenizer, wmdp_data, mmlu_data, idk_data)
+
+    print("\n📊 POST-UNLEARNING SEPARATION:")
+    wmdp_acts = get_activations(model, tokenizer, wmdp_data, target_layer)
+    mmlu_acts = get_activations(model, tokenizer, mmlu_data, target_layer)
+    idk_acts = get_activations(model, tokenizer, idk_data, target_layer)
+    sim_matrix = compute_separation(wmdp_acts, mmlu_acts, idk_acts)
+    print("        WMDP   MMLU    IDK")
+    for i, label in enumerate(["WMDP", "MMLU", "IDK"]):
+        row = f"{label:4s}  "
+        for j in range(3):
+            row += f"{sim_matrix[i,j]:6.3f} "
+        print(row)
+
+    print("\n🎉 LUNAR Training-Free Complete!")
+
 
 def lunar_train():
     """LUNAR training implementation"""
@@ -235,4 +330,31 @@ def lunar_train():
     print("\n🎉 LUNAR Training Complete!")
 
 if __name__ == "__main__":
-    lunar_train()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--training-free", default="no", choices=["yes", "no"])
+    args = parser.parse_args()
+
+    if args.training_free == "yes":
+        # Load model and data same as lunar_train, then call training_free
+        combined_data, _ = get_train_val_loaders()
+        wmdp_data = [item for item in combined_data if item['source'] == 'wmdp']
+        mmlu_data = [item for item in combined_data if item['source'] == 'mmlu']
+        idk_data = [item for item in combined_data if item['source'] == 'idk']
+
+        ckpts = sorted(glob.glob(os.path.join(SAVE_DIR, "best_model_*")))
+        if not ckpts:
+            raise RuntimeError(f"No trained models found in {SAVE_DIR}")
+        ckpt_path = ckpts[-1]
+        print(f"🔄 Loading base model: {MODEL_NAME}")
+        base_model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16, device_map="auto")
+        print(f"🔄 Loading LoRA adapter: {ckpt_path}")
+        model = PeftModel.from_pretrained(base_model, ckpt_path, is_trainable=True)
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        tokenizer.pad_token = tokenizer.eos_token
+
+        print("\n🧪 BEFORE UNLEARNING:")
+        test_samples(model, tokenizer, wmdp_data, mmlu_data, idk_data)
+
+        training_free(model, tokenizer, wmdp_data, mmlu_data, idk_data)
+    else:
+        lunar_train()
