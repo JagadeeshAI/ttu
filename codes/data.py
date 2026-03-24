@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Data loaders for LLaMA training using WMDP + MMLU datasets."""
+"""Data loaders for LLaMA training using WMDP-bio dataset."""
 
 import random
 import torch
@@ -34,26 +34,6 @@ def load_wmdp_data(seed=42):
     return data
 
 
-def load_mmlu_data(seed=42, max_samples=750):
-    """Load MMLU — random 750 samples from test split with source tag"""
-    random.seed(seed)
-
-    data = []
-    ds = load_dataset("cais/mmlu", "all")
-
-    for row in ds["test"]:
-        choices = "\n".join(
-            [f"{chr(65+i)}) {c}" for i, c in enumerate(row["choices"])]
-        )
-        prompt = f"{row['question']}\n\nChoices:\n{choices}\n\nAnswer:"
-        response = row["choices"][row["answer"]]
-        data.append({"prompt": prompt, "response": response, "source": "mmlu"})
-
-    random.shuffle(data)
-    if len(data) > max_samples:
-        data = data[:max_samples]
-
-    return data
 
 
 def filter_by_avg_length(data, label="Train"):
@@ -77,41 +57,12 @@ def filter_by_avg_length(data, label="Train"):
     filtered_lens = [tl for tl in token_lens if tl <= avg_len]
 
     wmdp_count = sum(1 for item in filtered if item["source"] == "wmdp")
-    mmlu_count = sum(1 for item in filtered if item["source"] == "mmlu")
-
-
-    wmdp_count = sum(1 for item in filtered if item["source"] == "wmdp")
-    mmlu_count = sum(1 for item in filtered if item["source"] == "mmlu")
-    idk_count = sum(1 for item in filtered if item["source"] == "idk")
-    print(f"   → WMDP: {wmdp_count}, MMLU: {mmlu_count}, IDK: {idk_count}")
+    print(f"   → WMDP: {wmdp_count}")
 
 
     return filtered, leftover
 
 
-def load_cyber_idk_data(seed=42, max_samples=750):
-    """Load WMDP-cyber questions as IDK samples — question only, no choices."""
-    random.seed(seed)
-
-    data = []
-    ds = load_dataset("cais/wmdp", "wmdp-cyber")
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    max_tokens = max(len(tokenizer.encode(row['question'] + '\n\n' + ''.join([f'{chr(65+i)}) {c}\n' for i, c in enumerate(row['choices'])]) + 'Answer: I don\'t know')) for row in ds["test"])
-
-    for row in ds["test"]:
-        # Question only — no choices for refusal
-        data.append({
-            "prompt": row["question"],
-            "response": "I don't know",
-            "source": "idk"
-        })
-
-    random.shuffle(data)
-    if len(data) > max_samples:
-        data = data[:max_samples]
-
-    return data
 
 
 
@@ -246,43 +197,22 @@ def get_dynamic_dataloader(dataset, batch_size, max_seq_len=None):
 
 
 def get_train_val_loaders():
-    """Load WMDP-bio + MMLU + WMDP-cyber(IDK), filter by 128 tokens max"""
+    """Load WMDP-bio, filter by 128 tokens max"""
     wmdp_data = load_wmdp_data()
-    mmlu_data = load_mmlu_data()
-    idk_data = load_cyber_idk_data()
 
-    # Filter each dataset by 128 token limit
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     tokenizer.pad_token = tokenizer.eos_token
 
-    filtered_datasets = []
-    for name, data in [("WMDP", wmdp_data), ("MMLU", mmlu_data), ("IDK", idk_data)]:
-        tokens = [len(tokenizer.encode(f"### Prompt: {item['prompt']}\n### Response: {item['response']}{tokenizer.eos_token}", add_special_tokens=False)) for item in data]
-        token_limit = 512 if name == "IDK" else 128
-        filtered_data = [item for item, token_count in zip(data, tokens) if token_count <= token_limit]
+    tokens = [len(tokenizer.encode(f"### Prompt: {item['prompt']}\n### Response: {item['response']}{tokenizer.eos_token}", add_special_tokens=False)) for item in wmdp_data]
+    final_data = [item for item, token_count in zip(wmdp_data, tokens) if token_count <= 128]
 
-
-        filtered_datasets.append(filtered_data)
-
-    wmdp_filtered, mmlu_filtered, idk_filtered = filtered_datasets
-    combined = wmdp_filtered + mmlu_filtered + idk_filtered
-
-    # Take 750 samples from each dataset if available
-    final_data = []
-    for name, data in [("WMDP", wmdp_filtered), ("MMLU", mmlu_filtered), ("IDK", idk_filtered)]:
-        selected = data[:750] if len(data) >= 750 else data
-        final_data.extend(selected)
     random.shuffle(final_data)
     return final_data, []
 
 
 if __name__ == "__main__":
-    print("🔍 Debug: Loading WMDP + MMLU + IDK data...")
+    print("🔍 Debug: Loading WMDP-bio data...")
     train_data, _ = get_train_val_loaders()
-
-    for src in ["wmdp", "mmlu", "idk"]:
-        samples = [s for s in train_data if s["source"] == src]
-        if samples:
-            print(f"\n📝 {src.upper()}: {len(samples)} samples")
-            print(f"   Sample: {samples[0]['prompt'][:100]}...")
-            print(f"   Response: '{samples[0]['response']}'")
+    print(f"\n📝 WMDP: {len(train_data)} samples")
+    print(f"   Sample: {train_data[0]['prompt'][:100]}...")
+    print(f"   Response: '{train_data[0]['response']}'")

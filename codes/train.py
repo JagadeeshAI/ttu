@@ -51,8 +51,6 @@ def train():
     best_acc = 0.0
     train_acc = 0.0
     wmdp_acc = 0.0
-    mmlu_acc = 0.0
-    idk_acc = 0.0
 
     print(f"\n🚀 Training on {DEVICE}")
     print(f"Train samples: {len(train_data)}")
@@ -66,12 +64,8 @@ def train():
         # Per-source accuracy tracking
         wmdp_correct = 0
         wmdp_total = 0
-        mmlu_correct = 0
-        mmlu_total = 0
-        idk_correct = 0
-        idk_total = 0
+
         wmdp_printed = False
-        mmlu_printed = False
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
 
@@ -122,26 +116,10 @@ def train():
                                 prompt_snippet = tokenizer.decode(input_ids[i], skip_special_tokens=True)[:80]
                                 print(f"\n✅ [WMDP] prompt='{prompt_snippet}...' | model='{pred_text}' === correct='{label_text}'")
                                 # wmdp_printed = True
-                        elif src == "mmlu":
-                            mmlu_correct += sample_correct
-                            mmlu_total += sample_total
-                            if sample_correct == sample_total and sample_total > 0 and not mmlu_printed:
-                                pred_text = tokenizer.decode(preds[i][sample_mask], skip_special_tokens=True).strip()
-                                label_text = tokenizer.decode(shifted_labels[i][sample_mask], skip_special_tokens=True).strip()
-                                prompt_snippet = tokenizer.decode(input_ids[i], skip_special_tokens=True)[:80]
-                                print(f"\n✅ [MMLU] prompt='{prompt_snippet}...' | model='{pred_text}' === correct='{label_text}'")
-                                # mmlu_printed = True
-                        elif src == "idk":
-                            pred_text = tokenizer.decode(preds[i][sample_mask], skip_special_tokens=True).strip()
-                            label_text = tokenizer.decode(shifted_labels[i][sample_mask], skip_special_tokens=True).strip()
-                            idk_total += 1
-                            if pred_text.lower() == label_text.lower():
-                                idk_correct += 1
-                                print(f"\n✅ [IDK] pred='{pred_text}' === label='{label_text}'")
+
 
                     wmdp_acc = wmdp_correct / wmdp_total if wmdp_total > 0 else 0
-                    mmlu_acc = mmlu_correct / mmlu_total if mmlu_total > 0 else 0
-                    train_acc = (wmdp_correct + mmlu_correct) / (wmdp_total + mmlu_total) if (wmdp_total + mmlu_total) > 0 else 0
+                    train_acc = wmdp_acc
 
             # Scaled backward pass
             scaler.scale(loss).backward()
@@ -156,42 +134,41 @@ def train():
             # ===== UPDATE PROGRESS BAR =====
             pbar.set_postfix({
                 "loss": f"{loss.item():.4f}",
-                "wmdp": f"{wmdp_acc*100:.1f}%",
-                "mmlu": f"{mmlu_acc*100:.1f}%",
-                "idk": f"{idk_correct}/{idk_total}"
+                "wmdp": f"{wmdp_acc*100:.1f}%"
             })
 
         avg_train_loss = train_loss / len(train_loader)
 
         print(f"\n Epoch {epoch+1}/{EPOCHS}")
         print(f"Train Loss: {avg_train_loss:.4f}")
-        print(f"Token Accuracy — WMDP: {wmdp_acc*100:.2f}% | MMLU: {mmlu_acc*100:.2f}%")
+        print(f"Token Accuracy — WMDP: {wmdp_acc*100:.2f}%")
 
-        # ===== IDK CHECK — REAL GENERATION (no teacher forcing) =====
+        # ===== QUESTION-ONLY EVAL (no choices) =====
         model.eval()
-        idk_samples = [s for s in train_data if s["source"] == "idk"]
-        # Use unique IDK samples (remove duplicates from oversampling)
-        unique_idk = {s["prompt"]: s for s in idk_samples}
-        unique_idk = list(unique_idk.values())
-        test_samples = random.sample(unique_idk, min(10, len(unique_idk)))
-        idk_pass = 0
-        for s in test_samples:
+        eval_correct = 0
+        eval_samples = random.sample(train_data, min(50, len(train_data)))
+        for idx, s in enumerate(eval_samples):
             prompt_text = f"### Prompt: {s['prompt']}\n### Response:"
             inputs = tokenizer(prompt_text, return_tensors="pt").to(DEVICE)
             with torch.no_grad():
                 out = model.generate(
                     inputs.input_ids, attention_mask=inputs.attention_mask,
-                    max_new_tokens=20, do_sample=False, pad_token_id=tokenizer.eos_token_id
+                    max_new_tokens=30, do_sample=False, pad_token_id=tokenizer.eos_token_id
                 )
             resp = tokenizer.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
-            is_idk = "don't know" in resp.lower()
-            if is_idk:
-                idk_pass += 1
-            status = "✅" if is_idk else "❌"
-            print(f"   {status} Q: {s['prompt'][:60]}...")
-            print(f"      A: {resp}")
-        print(f" IDK: {idk_pass}/{len(test_samples)} correct")
+            correct = s['response'].lower() in resp.lower()
+            if correct:
+                eval_correct += 1
+            if idx < 3:
+                status = "✅" if correct else "❌"
+                print(f"   {status} Q: {s['prompt'][:60]}...")
+                print(f"      Model: {resp[:80]}")
+                print(f"      Answer: {s['response']}")
+        eval_acc = eval_correct / len(eval_samples)
+        print(f"📊 Question-Only Eval: {eval_correct}/{len(eval_samples)} = {eval_acc*100:.1f}%")
         model.train()
+
+
 
         # ===== SAVE BEST MODEL =====
         if train_acc > best_acc:
