@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 call_super.py — Self-updating unlearning orchestrator.
-Uses Qwen2.5-Coder-7B via HuggingFace Inference API to generate unlearning script.
+Uses Qwen2.5-Coder-7B via HuggingFace Inference API to generate LUNAR unlearning script.
 
-Usage: python super/call_super.py "Sneha Singh"
+Usage: python super/call_super.py
 """
 
 import sys
@@ -13,9 +13,9 @@ from openai import OpenAI
 
 # Add root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from codes.config import SAVE_DIR, MODEL_NAME, EPOCHS
+from codes.config import SAVE_DIR, MODEL_NAME
 
-FORGET_FILE = "unlearning/forget.py"
+FORGET_FILE = "super/forget.py"
 
 # HuggingFace Inference API
 client = OpenAI(
@@ -25,64 +25,118 @@ client = OpenAI(
 CODER_MODEL = "Qwen/Qwen2.5-Coder-7B-Instruct"
 
 # ---------- BUILD PROMPT ----------
-def build_prompt(forget_name):
+def build_prompt():
     ckpts = sorted(glob.glob(os.path.join(SAVE_DIR, "best_model_*")))
     ckpt_path = ckpts[-1] if ckpts else "checkpoints/best_model"
 
-    prompt = f"""Write a complete Python script that makes a language model forget about "{forget_name}".
+    prompt = f"""Write a complete, standalone Python script that performs machine unlearning using the LUNAR (activation redirection) method on a fine-tuned LLaMA model. The script must be self-contained — do NOT import from any local modules like codes.data or codes.config. Inline everything.
 
-Allowed imports (use ONLY these):
-- import json
-- import torch
-- import random
-- from torch.optim import AdamW
-- from transformers import AutoTokenizer, AutoModelForCausalLM
-- from peft import PeftModel
-- from tqdm import tqdm
+Here is the exact algorithm to implement. YOU MUST follow this exact order:
 
-Step 1 - Load model (do these in this exact order):
-- Load base model: AutoModelForCausalLM.from_pretrained("{MODEL_NAME}", torch_dtype=torch.bfloat16, device_map="auto")
-- Load tokenizer: AutoTokenizer.from_pretrained("{MODEL_NAME}")
-- Set tokenizer.pad_token = tokenizer.eos_token
-- Load LoRA adapter on top: model = PeftModel.from_pretrained(base_model, "{ckpt_path}", is_trainable=True)
+## Step 0 — Suppress warnings (put this at the very top after imports)
+- import warnings; warnings.filterwarnings("ignore")
+- import os; os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-Step 2 - Load data:
-- Read "data/bio.jsonl" using json.loads on each line. Each line has "name" and "bio" fields.
-- Split: forget_set = entries where name == "{forget_name}", retain_set = all others
-- Repeat forget_set to match retain_set size
+## Step 1 — Load model and tokenizer FIRST (before anything else that uses tokenizer)
+- base = AutoModelForCausalLM.from_pretrained("{MODEL_NAME}", torch_dtype=torch.bfloat16, device_map="auto")
+- model = PeftModel.from_pretrained(base, "{ckpt_path}", is_trainable=True)
+- tokenizer = AutoTokenizer.from_pretrained("{MODEL_NAME}")
+- tokenizer.pad_token = tokenizer.eos_token
 
-Step 3 - Define a reusable test function BEFORE training (define it once, call it multiple times):
-- The function takes a name, generates a response using "### Prompt: Tell me about [name]\\n### Response: " with max_new_tokens=100, do_sample=False, pad_token_id=tokenizer.eos_token_id
-- Generate ONE prompt at a time (do NOT batch multiple prompts together)
-- Decode using tokenizer.decode(output[0], skip_special_tokens=True), return first 120 chars
-- Call this function for "{forget_name}" and first person from retain_set, print results as "BEFORE TRAINING:"
+## Step 2 — Load WMDP-bio data (tokenizer is now available)
+- Use: from datasets import load_dataset
+- ds = load_dataset("cais/wmdp", "wmdp-bio")
+- Build all samples first into a list called all_data:
+  - For each row in ds["test"], build:
+    - choices = "\\n".join([f"{{chr(65+i)}}) {{c}}" for i, c in enumerate(row["choices"])])
+    - prompt = f"{{row['question']}}\\n\\nChoices:\\n{{choices}}\\n\\nAnswer:"
+    - response = row["choices"][row["answer"]]
+    - Append dict with keys: "prompt", "response", "source" (source="wmdp" for now)
+- Filter: keep only samples where len(tokenizer.encode(f"### Prompt: {{prompt}}\\n### Response: {{response}}{{tokenizer.eos_token}}", add_special_tokens=False)) <= 128
+- Split: forget_set = [dict(all_data[0], source='forget')], retain_set = [dict(s, source='retain') for s in all_data[1:]]
 
-Step 4 - Manual training loop ({EPOCHS} epochs):
-- optimizer = AdamW(model.parameters(), lr=2e-4)
-- IMPORTANT: Combine forget_set and retain_set into one list, then SHUFFLE it randomly using random.shuffle. This interleaves forget and retain steps to prevent model collapse.
-- Only repeat forget_set 10 times (not full retain_set size) to avoid too many gradient ascent steps
-- For each epoch, wrap the INNER loop over entries with tqdm(combined_set, desc=f"Epoch {{epoch+1}}")
-- For each entry: tokenize, move to cuda, forward pass with labels=input_ids
-- If entry name == "{forget_name}": loss = -loss (gradient ascent)
-- Clip gradients: torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-- optimizer.zero_grad(), loss.backward(), optimizer.step()
-- AFTER each epoch ends: call the test function for "{forget_name}" and first retain person, print "Epoch X:"
+## Step 3 — Eval function (define BEFORE unlearning, reuse AFTER)
+- eval_accuracy(model, tokenizer, data, label): for first 50 samples, generate with max_new_tokens=30, do_sample=False, check if correct response is in model output (case-insensitive). Print accuracy.
+- print_sample(model, tokenizer, item, label): print full prompt and model output for one sample.
 
-Step 5 - Test AFTER all training:
-- Call the same test function, print "AFTER TRAINING:"
+## Step 4 — BEFORE unlearning
+- eval_accuracy on forget_set and retain_set
+- print_sample on forget_set[0] and a random retain sample
 
-Do NOT import from bitsandbytes directly. Do NOT use Trainer or TrainingArguments. Do NOT save the model. Write only Python code."""
+## Step 5 — LUNAR Unlearning (Low-Rank Decomposition method, rank=32)
+TARGET_LAYER = 6
+RANK = 32
+
+5a. Compute steering vector r_SV:
+- Define a function get_layer_acts(prompt_text) that:
+  - inputs = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=256).to(model.device)
+  - with torch.no_grad(): out = model.generate(inputs.input_ids, attention_mask=inputs.attention_mask, max_new_tokens=20, do_sample=False, output_hidden_states=True, return_dict_in_generate=True, pad_token_id=tokenizer.eos_token_id)
+  - IMPORTANT: out.hidden_states[-1] is a tuple of layer tensors. Index it as: out.hidden_states[-1][1:][TARGET_LAYER]
+  - return out.hidden_states[-1][1:][TARGET_LAYER].mean(dim=1).float().cpu().numpy().flatten()
+- idk_acts = get_layer_acts("### Prompt: I don't know\\n### Response:")
+- forget_acts = get_layer_acts(f"### Prompt: {{forget_set[0]['prompt']}}\\n### Response:")
+- r_sv = torch.from_numpy(idk_acts - forget_acts).to(model.device, dtype=torch.bfloat16)
+
+5b. Collect H and O':
+- Create 1 idk sample: {{"prompt": f"I don't know{{tokenizer.eos_token}}", "response": f"I don't know{{tokenizer.eos_token}}", "source": "idk"}}
+- Combine: forget_set[:100] + retain_set[:100] + [idk_sample]
+- mlp = model.base_model.model.model.layers[TARGET_LAYER].mlp
+- down_proj = mlp.down_proj
+- For each sample in tqdm loop:
+  - tokenize f"### Prompt: {{item['prompt']}}\\n### Response: {{item['response']}}" with max_length=256, truncation=True
+  - Register hook on down_proj to capture input[0] (h_cap), register hook on mlp to capture output (o_cap)
+  - IMPORTANT: hooks must be registered INSIDE the loop and removed after each sample
+  - with torch.no_grad(): model(**inputs)
+  - Remove both hooks
+  - h = h_cap[0].reshape(-1, h_cap[0].shape[-1]).float()
+  - o = o_cap[0].reshape(-1, o_cap[0].shape[-1]).float()
+  - If item['source'] == 'forget': o = o + r_sv.float().unsqueeze(0).expand_as(o)
+  - Append h.cpu() and o.cpu() to lists
+- H = torch.cat(all_H, dim=0), O_prime = torch.cat(all_O_prime, dim=0)
+
+5c. Solve for W_new (Low-Rank Decomposition, rank=32):
+- B = torch.randn(RANK, H.shape[1])
+- B = torch.linalg.qr(B.T).Q.T[:RANK]    # orthonormalize rows
+- A = H @ B.T                              # (n, r)
+- AtA_inv = torch.linalg.inv(A.T @ A)     # (r, r)
+- A_plus = AtA_inv @ A.T                   # (r, n)
+- BBt_inv = torch.linalg.inv(B @ B.T)     # (r, r)
+- B_plus = B.T @ BBt_inv                   # (d_ff, r)
+- W_new = B_plus @ (A_plus @ O_prime)   # (d_ff, d)
+
+5d. Replace weight:
+- with torch.no_grad(): down_proj.weight.copy_(W_new.T.to(down_proj.weight.dtype).to(down_proj.weight.device))
+
+## Step 6 — AFTER unlearning
+- Same eval_accuracy and print_sample as Step 4
+
+IMPORTANT RULES:
+- PeftModel is from peft, NOT transformers: "from peft import PeftModel"
+- Load tokenizer BEFORE using it — do NOT call tokenizer() before AutoTokenizer.from_pretrained()
+- Load model and tokenizer FIRST, then load/filter data
+- Do NOT import from codes.data, codes.config, or any local module
+- Do NOT use Trainer or TrainingArguments
+- Do NOT save the model
+- Use tqdm for progress bars
+- ALWAYS pass attention_mask and pad_token_id=tokenizer.eos_token_id to model.generate()
+- Use "### Prompt: ...\\n### Response:" format for all prompts
+- For idk prompt use: f"I don't know{{tokenizer.eos_token}}" (not eos_id)
+- out.hidden_states[-1] is a TUPLE of layer tensors, NOT a single tensor. You must index it: out.hidden_states[-1][1:][TARGET_LAYER]
+- First sample after filtering = forget_set, rest = retain_set (simple index split, not by answer value)
+- The script must run with: python super/forget.py
+- Write ONLY Python code, no markdown"""
     return prompt
 
 # ---------- VALIDATE ----------
-def validate_code(code, forget_name):
+def validate_code(code):
     checks = {
         "imports torch": "import torch" in code or "from torch" in code,
         "loads model": "from_pretrained" in code,
-        "has forget name": forget_name in code,
-        "has gradient logic": "backward" in code,
-        "has data loading": "bio.jsonl" in code or "json" in code,
-        "no bad imports": "from transformers import" not in code or "AdamW" not in code.split("from transformers import")[1].split("\n")[0] if "from transformers import" in code else True,
+        "has hook logic": "register_forward_hook" in code,
+        "has matrix inverse": "linalg.inv" in code or "torch.inverse" in code,
+        "has wmdp data": "wmdp" in code.lower(),
+        "peft import correct": "from peft import" in code,
+        "no gradient ascent": "-loss" not in code and "= -" not in code.split("loss")[0] if "loss" in code else True,
         "is valid python": False,
     }
 
@@ -99,14 +153,14 @@ def validate_code(code, forget_name):
     return passed
 
 # ---------- GENERATE VIA API ----------
-def generate_forget_code(forget_name):
-    prompt = build_prompt(forget_name)
+def generate_forget_code():
+    prompt = build_prompt()
 
     print(f"🧠 Asking {CODER_MODEL} via HF API...")
     completion = client.chat.completions.create(
         model=CODER_MODEL,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=2000,
+        max_tokens=4000,
         temperature=0.1,
     )
 
@@ -127,12 +181,12 @@ def generate_forget_code(forget_name):
     return code
 
 # ---------- MAIN ----------
-def call_super(forget_name):
-    code = generate_forget_code(forget_name)
+def call_super():
+    code = generate_forget_code()
 
     # Validate
     print(f"\n🔍 Validating generated code:")
-    if validate_code(code, forget_name):
+    if validate_code(code):
         print(f"\n✅ All checks passed — running model-generated code!")
     else:
         print(f"\n❌ Validation failed — NOT running. Check the generated code above.")
@@ -148,8 +202,4 @@ def call_super(forget_name):
     subprocess.run([sys.executable, FORGET_FILE])
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print('Usage: python super/call_super.py "Sneha Singh"')
-        sys.exit(1)
-
-    call_super(sys.argv[1])
+    call_super()

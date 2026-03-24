@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """LUNAR — Unlearning via Activation Redirection"""
 
-import torch, numpy as np, random, glob, os, argparse, time
+import torch, numpy as np, random, glob, os, argparse, time, warnings
+warnings.filterwarnings("ignore")
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 from tqdm import tqdm
