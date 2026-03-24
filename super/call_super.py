@@ -25,9 +25,30 @@ client = OpenAI(
 CODER_MODEL = "Qwen/Qwen2.5-Coder-7B-Instruct"
 
 # ---------- BUILD PROMPT ----------
-def build_prompt():
+def build_prompt(forget_prompt=None, forget_response=None):
     ckpts = sorted(glob.glob(os.path.join(SAVE_DIR, "best_model_*")))
     ckpt_path = ckpts[-1] if ckpts else "checkpoints/best_model"
+
+    # If a specific forget prompt is provided, inject it into the data split
+    if forget_prompt:
+        forget_inject = f"""
+4c-alt. FORGET SET OVERRIDE — The user has requested to forget a SPECIFIC prompt.
+  Instead of using filtered[0] as the forget set, find the sample in filtered whose prompt
+  BEST matches this target (use substring match or exact match):
+  TARGET FORGET PROMPT: \"\"\"{forget_prompt}\"\"\"
+  TARGET FORGET RESPONSE: \"\"\"{forget_response or ''}\"\"\"
+
+  To do this:
+  - After building filtered list, search for the matching sample:
+    forget_idx = next((i for i, s in enumerate(filtered) if "{forget_prompt[:80]}" in s["prompt"]), 0)
+  - forget_set = [dict(filtered[forget_idx], source='forget')]
+  - retain_set = [dict(s, source='retain') for s in filtered[:forget_idx] + filtered[forget_idx+1:]]
+"""
+    else:
+        forget_inject = """
+  forget_set = [dict(filtered[0], source='forget')]
+  retain_set = [dict(s, source='retain') for s in filtered[1:]]
+"""
 
     prompt = f"""Write a complete, standalone Python script implementing the RePAIR/LUNAR machine unlearning method (activation redirection) on a fine-tuned LLaMA model. Self-contained — NO local imports (no codes.data, codes.config).
 
@@ -96,7 +117,7 @@ Paper Eq 11-12: W_new = (H^T H + λI)^{{-1}} H^T O'
 - down_proj = mlp.down_proj
 - r_sv = compute_steering_vector(model, tokenizer, forget_set)
 - idk_samples = make_idk_samples(tokenizer)
-- samples = forget_set[:100] + retain_set[:500] + idk_samples  # Use 500 retain samples to preserve retain knowledge
+- samples = forget_set[:1] + retain_set[:99] + idk_samples  # TOTAL ~101 samples max to avoid OOM crash
 - H, O_prime = collect_H_O_prime(model, tokenizer, samples, down_proj, mlp, r_sv)
 - print(f"   H: {{H.shape}}, O': {{O_prime.shape}}")
 - HtH = H.T @ H
@@ -162,8 +183,7 @@ The main block MUST contain ALL of the following IN ORDER:
       response = row["choices"][row["answer"]]
       all_data.append({{"prompt": prompt, "response": response, "source": "wmdp"}})
   filtered = [s for s in all_data if len(tokenizer.encode(f"### Prompt: {{s['prompt']}}\\n### Response: {{s['response']}}{{tokenizer.eos_token}}", add_special_tokens=False)) <= 128]
-  forget_set = [dict(filtered[0], source='forget')]
-  retain_set = [dict(s, source='retain') for s in filtered[1:]]
+{forget_inject}
 
 4d. BEFORE UNLEARNING:
 - eval_accuracy on forget_set with label="FORGET"
@@ -187,7 +207,7 @@ CRITICAL RULES:
 - print_sample prompt must NOT include item['response'] — only "### Prompt: ...\\n### Response:"
 - Default method is Moore-Penrose (--rank-decomposition=no), NOT low-rank
 - LAMBDA MUST be 1.0 (not 1e-4 or smaller). Small lambda destroys retain knowledge.
-- Use retain_set[:500] (not [:100]) to preserve retain knowledge. More retain samples = better retention.
+- Use forget_set[:1] + retain_set[:99] + idk_samples — TOTAL ~101 samples max. More than this causes OOM crash.
 - Write ONLY Python code, no markdown, no explanations"""
     return prompt
 
@@ -217,8 +237,8 @@ def validate_code(code):
     return passed
 
 # ---------- GENERATE VIA API ----------
-def generate_forget_code():
-    prompt = build_prompt()
+def generate_forget_code(forget_prompt=None, forget_response=None):
+    prompt = build_prompt(forget_prompt=forget_prompt, forget_response=forget_response)
 
     print(f"🧠 Asking {CODER_MODEL} via HF API...")
     completion = client.chat.completions.create(
@@ -245,8 +265,8 @@ def generate_forget_code():
     return code
 
 # ---------- MAIN ----------
-def call_super():
-    code = generate_forget_code()
+def call_super(forget_prompt=None, forget_response=None):
+    code = generate_forget_code(forget_prompt=forget_prompt, forget_response=forget_response)
 
     # Validate
     print(f"\n🔍 Validating generated code:")
@@ -266,4 +286,9 @@ def call_super():
     subprocess.run([sys.executable, FORGET_FILE])
 
 if __name__ == "__main__":
-    call_super()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--forget-prompt", type=str, default=None, help="Specific prompt to forget")
+    parser.add_argument("--forget-response", type=str, default=None, help="Response of the prompt to forget")
+    args = parser.parse_args()
+    call_super(forget_prompt=args.forget_prompt, forget_response=args.forget_response)
