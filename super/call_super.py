@@ -29,102 +29,166 @@ def build_prompt():
     ckpts = sorted(glob.glob(os.path.join(SAVE_DIR, "best_model_*")))
     ckpt_path = ckpts[-1] if ckpts else "checkpoints/best_model"
 
-    prompt = f"""Write a complete, standalone Python script that performs machine unlearning using the LUNAR (activation redirection) method on a fine-tuned LLaMA model. The script must be self-contained — do NOT import from any local modules like codes.data or codes.config. Inline everything.
+    prompt = f"""Write a complete, standalone Python script implementing the RePAIR/LUNAR machine unlearning method (activation redirection) on a fine-tuned LLaMA model. Self-contained — NO local imports (no codes.data, codes.config).
 
-Here is the exact algorithm to implement. YOU MUST follow this exact order:
+Follow this EXACT implementation. Copy the code patterns EXACTLY as shown.
 
-## Step 0 — Suppress warnings (put this at the very top after imports)
-- import warnings; warnings.filterwarnings("ignore")
-- import os; os.environ["TOKENIZERS_PARALLELISM"] = "false"
+## IMPORTS (copy exactly)
+```
+import warnings; warnings.filterwarnings("ignore")
+import os; os.environ["TOKENIZERS_PARALLELISM"] = "false"
+import torch, numpy as np, random, argparse, time
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
+from datasets import load_dataset
+from tqdm import tqdm
+```
 
-## Step 1 — Load model and tokenizer FIRST (before anything else that uses tokenizer)
-- base = AutoModelForCausalLM.from_pretrained("{MODEL_NAME}", torch_dtype=torch.bfloat16, device_map="auto")
-- model = PeftModel.from_pretrained(base, "{ckpt_path}", is_trainable=True)
-- tokenizer = AutoTokenizer.from_pretrained("{MODEL_NAME}")
-- tokenizer.pad_token = tokenizer.eos_token
-
-## Step 2 — Load WMDP-bio data (tokenizer is now available)
-- Use: from datasets import load_dataset
-- ds = load_dataset("cais/wmdp", "wmdp-bio")
-- Build all samples first into a list called all_data:
-  - For each row in ds["test"], build:
-    - choices = "\\n".join([f"{{chr(65+i)}}) {{c}}" for i, c in enumerate(row["choices"])])
-    - prompt = f"{{row['question']}}\\n\\nChoices:\\n{{choices}}\\n\\nAnswer:"
-    - response = row["choices"][row["answer"]]
-    - Append dict with keys: "prompt", "response", "source" (source="wmdp" for now)
-- Filter: keep only samples where len(tokenizer.encode(f"### Prompt: {{prompt}}\\n### Response: {{response}}{{tokenizer.eos_token}}", add_special_tokens=False)) <= 128
-- Split: forget_set = [dict(all_data[0], source='forget')], retain_set = [dict(s, source='retain') for s in all_data[1:]]
-
-## Step 3 — Eval function (define BEFORE unlearning, reuse AFTER)
-- eval_accuracy(model, tokenizer, data, label): for first 50 samples, generate with max_new_tokens=30, do_sample=False, check if correct response is in model output (case-insensitive). Print accuracy.
-- print_sample(model, tokenizer, item, label): print full prompt and model output for one sample.
-
-## Step 4 — BEFORE unlearning
-- eval_accuracy on forget_set and retain_set
-- print_sample on forget_set[0] and a random retain sample
-
-## Step 5 — LUNAR Unlearning (Low-Rank Decomposition method, rank=32)
+## CONSTANTS
 TARGET_LAYER = 6
-RANK = 32
+LAMBDA = 1.0   # Regularization strength — MUST be 1.0 (not 1e-4). Too small = retain knowledge destroyed
 
-5a. Compute steering vector r_SV:
-- Define a function get_layer_acts(prompt_text) that:
-  - inputs = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=256).to(model.device)
+## FUNCTION DEFINITIONS (define ALL functions BEFORE the main block)
+
+### 3a. get_activations(model, tokenizer, data, layer_idx=TARGET_LAYER, max_samples=20):
+- model.eval()
+- For each item in data[:max_samples]:
+  - inputs = tokenizer(f"### Prompt: {{item['prompt']}}\\n### Response:", return_tensors="pt", truncation=True, max_length=256).to(model.device)
   - with torch.no_grad(): out = model.generate(inputs.input_ids, attention_mask=inputs.attention_mask, max_new_tokens=20, do_sample=False, output_hidden_states=True, return_dict_in_generate=True, pad_token_id=tokenizer.eos_token_id)
-  - IMPORTANT: out.hidden_states[-1] is a tuple of layer tensors. Index it as: out.hidden_states[-1][1:][TARGET_LAYER]
-  - return out.hidden_states[-1][1:][TARGET_LAYER].mean(dim=1).float().cpu().numpy().flatten()
-- idk_acts = get_layer_acts("### Prompt: I don't know\\n### Response:")
-- forget_acts = get_layer_acts(f"### Prompt: {{forget_set[0]['prompt']}}\\n### Response:")
-- r_sv = torch.from_numpy(idk_acts - forget_acts).to(model.device, dtype=torch.bfloat16)
+  - IMPORTANT: out.hidden_states[-1] is a TUPLE. Access as: out.hidden_states[-1][1:][layer_idx]
+  - acts.append(out.hidden_states[-1][1:][layer_idx].mean(dim=1).float().cpu().numpy().flatten())
+- return np.array(acts)
 
-5b. Collect H and O':
-- Create 1 idk sample: {{"prompt": f"I don't know{{tokenizer.eos_token}}", "response": f"I don't know{{tokenizer.eos_token}}", "source": "idk"}}
-- Combine: forget_set[:100] + retain_set[:100] + [idk_sample]
-- mlp = model.base_model.model.model.layers[TARGET_LAYER].mlp
-- down_proj = mlp.down_proj
-- For each sample in tqdm loop:
-  - tokenize f"### Prompt: {{item['prompt']}}\\n### Response: {{item['response']}}" with max_length=256, truncation=True
-  - Register hook on down_proj to capture input[0] (h_cap), register hook on mlp to capture output (o_cap)
-  - IMPORTANT: hooks must be registered INSIDE the loop and removed after each sample
+### 3b. compute_steering_vector(model, tokenizer, forget_set):
+- Paper Eq 7: r_SV = mean(MLP_l(D_ref)) - mean(MLP_l(D_f))
+- ref_acts = get_activations for a single "I don't know" sample wrapped as [{{"prompt": "I don't know", "response": "", "source": "idk"}}]
+- forget_acts = get_activations(model, tokenizer, forget_set)
+- r_sv = np.mean(ref_acts, axis=0) - np.mean(forget_acts, axis=0)
+- return torch.from_numpy(r_sv).to(model.device, dtype=torch.bfloat16)
+
+### 3c. make_idk_samples(tokenizer):
+- return [{{"prompt": f"I don't know{{tokenizer.eos_token}}", "response": f"I don't know{{tokenizer.eos_token}}", "source": "idk"}}]
+
+### 3d. collect_H_O_prime(model, tokenizer, samples, down_proj, mlp_layer, r_sv):
+Paper Eq 8-10: Collect H (inputs to down_proj) and O' (desired MLP outputs with steering)
+- model.eval()
+- all_H, all_O_prime = [], []
+- For each item in tqdm(samples, desc="Collecting H, O'"):
+  - inputs = tokenizer(f"### Prompt: {{item['prompt']}}\\n### Response: {{item['response']}}", return_tensors="pt", max_length=256, truncation=True).to(model.device)
+  - HOOKS — use mutable list pattern (NEVER nonlocal):
+    h_cap, o_cap = [None], [None]
+    def hook_h(m, i, o): h_cap[0] = i[0].clone().detach()
+    def hook_o(m, i, o): o_cap[0] = o.clone().detach()
+  - Register and save handles:
+    hh = down_proj.register_forward_hook(hook_h)
+    ho = mlp_layer.register_forward_hook(hook_o)
   - with torch.no_grad(): model(**inputs)
-  - Remove both hooks
+  - Remove via handles: hh.remove(); ho.remove()
   - h = h_cap[0].reshape(-1, h_cap[0].shape[-1]).float()
   - o = o_cap[0].reshape(-1, o_cap[0].shape[-1]).float()
-  - If item['source'] == 'forget': o = o + r_sv.float().unsqueeze(0).expand_as(o)
-  - Append h.cpu() and o.cpu() to lists
-- H = torch.cat(all_H, dim=0), O_prime = torch.cat(all_O_prime, dim=0)
+  - Paper Eq 9: if item['source'] == 'forget': o = o + r_sv.float().unsqueeze(0).expand_as(o)
+  - all_H.append(h.cpu()); all_O_prime.append(o.cpu())
+- return torch.cat(all_H, dim=0), torch.cat(all_O_prime, dim=0)
 
-5c. Solve for W_new (Low-Rank Decomposition, rank=32):
-- B = torch.randn(RANK, H.shape[1])
-- B = torch.linalg.qr(B.T).Q.T[:RANK]    # orthonormalize rows
-- A = H @ B.T                              # (n, r)
-- AtA_inv = torch.linalg.inv(A.T @ A)     # (r, r)
-- A_plus = AtA_inv @ A.T                   # (r, n)
-- BBt_inv = torch.linalg.inv(B @ B.T)     # (r, r)
-- B_plus = B.T @ BBt_inv                   # (d_ff, r)
-- W_new = B_plus @ (A_plus @ O_prime)   # (d_ff, d)
-
-5d. Replace weight:
+### 3e. unlearn_moore_penrose(model, tokenizer, forget_set, retain_set):
+Paper Eq 11-12: W_new = (H^T H + λI)^{{-1}} H^T O'
+- mlp = model.base_model.model.model.layers[TARGET_LAYER].mlp
+- down_proj = mlp.down_proj
+- r_sv = compute_steering_vector(model, tokenizer, forget_set)
+- idk_samples = make_idk_samples(tokenizer)
+- samples = forget_set[:100] + retain_set[:500] + idk_samples  # Use 500 retain samples to preserve retain knowledge
+- H, O_prime = collect_H_O_prime(model, tokenizer, samples, down_proj, mlp, r_sv)
+- print(f"   H: {{H.shape}}, O': {{O_prime.shape}}")
+- HtH = H.T @ H
+- HtH += LAMBDA * torch.eye(HtH.shape[0])
+- HtH_inv = torch.linalg.inv(HtH)
+- H_plus = HtH_inv @ H.T
+- W_new = H_plus @ O_prime
 - with torch.no_grad(): down_proj.weight.copy_(W_new.T.to(down_proj.weight.dtype).to(down_proj.weight.device))
 
-## Step 6 — AFTER unlearning
-- Same eval_accuracy and print_sample as Step 4
+### 3f. unlearn_low_rank(model, tokenizer, forget_set, retain_set, rank=32):
+Paper Eq 13-16: H ≈ A·B, W_new = B+ · A+ · O'
+- Same setup as moore_penrose (mlp, down_proj, r_sv, samples, H, O_prime)
+- B = torch.randn(rank, H.shape[1])
+- B = torch.linalg.qr(B.T).Q.T[:rank]
+- A = H @ B.T
+- AtA_inv = torch.linalg.inv(A.T @ A)
+- A_plus = AtA_inv @ A.T
+- BBt_inv = torch.linalg.inv(B @ B.T)
+- B_plus = B.T @ BBt_inv
+- W_new = B_plus @ (A_plus @ O_prime)
+- with torch.no_grad(): down_proj.weight.copy_(W_new.T.to(down_proj.weight.dtype).to(down_proj.weight.device))
 
-IMPORTANT RULES:
-- PeftModel is from peft, NOT transformers: "from peft import PeftModel"
-- Load tokenizer BEFORE using it — do NOT call tokenizer() before AutoTokenizer.from_pretrained()
-- Load model and tokenizer FIRST, then load/filter data
-- Do NOT import from codes.data, codes.config, or any local module
-- Do NOT use Trainer or TrainingArguments
-- Do NOT save the model
-- Use tqdm for progress bars
+### 3g. eval_accuracy(model, tokenizer, data, label=""):
+- model.eval()
+- correct = 0; data = data[:50]
+- For each item in tqdm(data, desc=f"Eval {{label}}"):
+  - prompt_text = f"### Prompt: {{item['prompt']}}\\n### Response:"
+  - inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+  - with torch.no_grad(): out = model.generate(inputs.input_ids, attention_mask=inputs.attention_mask, max_new_tokens=30, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+  - resp = tokenizer.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
+  - if item['response'].lower() in resp.lower(): correct += 1
+- print(f"[{{label}}] Accuracy: {{correct}}/{{len(data)}} = {{correct/len(data)*100:.1f}}%")
+- return correct / len(data)
+
+### 3h. print_sample(model, tokenizer, item, label=""):
+- model.eval()
+- prompt_text = f"### Prompt: {{item['prompt']}}\\n### Response:"
+- DO NOT include item['response'] in the prompt — only for display after
+- inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+- with torch.no_grad(): out = model.generate(inputs.input_ids, attention_mask=inputs.attention_mask, max_new_tokens=30, do_sample=False, pad_token_id=tokenizer.eos_token_id)
+- resp = tokenizer.decode(out[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
+- print(f"[{{label}}] PROMPT: {{item['prompt'][:100]}}...")
+- print(f"MODEL OUTPUT: {{resp}}")
+- print(f"CORRECT: {{item['response']}}")
+
+## Step 4 — MAIN BLOCK (under if __name__ == "__main__":)
+The main block MUST contain ALL of the following IN ORDER:
+
+4a. Parse args: --rank-decomposition (yes/no, default="no"), --rank (int, default=32)
+
+4b. Load model & tokenizer FIRST (tokenizer needed for data filtering):
+  base = AutoModelForCausalLM.from_pretrained("{MODEL_NAME}", torch_dtype=torch.bfloat16, device_map="auto")
+  model = PeftModel.from_pretrained(base, "{ckpt_path}", is_trainable=True)
+  tokenizer = AutoTokenizer.from_pretrained("{MODEL_NAME}")
+  tokenizer.pad_token = tokenizer.eos_token
+
+4c. Load WMDP-bio data — THIS IS MANDATORY, do NOT skip (copy exactly):
+  ds = load_dataset("cais/wmdp", "wmdp-bio")
+  all_data = []
+  for row in ds["test"]:
+      choices = "\\n".join([f"{{chr(65+i)}}) {{c}}" for i, c in enumerate(row["choices"])])
+      prompt = f"{{row['question']}}\\n\\nChoices:\\n{{choices}}\\n\\nAnswer:"
+      response = row["choices"][row["answer"]]
+      all_data.append({{"prompt": prompt, "response": response, "source": "wmdp"}})
+  filtered = [s for s in all_data if len(tokenizer.encode(f"### Prompt: {{s['prompt']}}\\n### Response: {{s['response']}}{{tokenizer.eos_token}}", add_special_tokens=False)) <= 128]
+  forget_set = [dict(filtered[0], source='forget')]
+  retain_set = [dict(s, source='retain') for s in filtered[1:]]
+
+4d. BEFORE UNLEARNING:
+- eval_accuracy on forget_set with label="FORGET"
+- eval_accuracy on retain_set with label="RETAIN"
+- print_sample on forget_set[0] and random.choice(retain_set)
+
+4e. UNLEARNING:
+- If rank_decomposition == "yes": call unlearn_low_rank else call unlearn_moore_penrose
+
+4f. AFTER UNLEARNING:
+- Same eval_accuracy and print_sample again
+
+CRITICAL RULES:
+- Structure code as FUNCTIONS (get_activations, compute_steering_vector, make_idk_samples, collect_H_O_prime, unlearn_moore_penrose, unlearn_low_rank, eval_accuracy, print_sample) + main block
+- from peft import PeftModel (NOT from transformers)
+- NEVER use "nonlocal" — causes SyntaxError. Use mutable list: h_cap = [None]; def hook(m,i,o): h_cap[0] = ...
+- Remove hooks via HANDLE.remove(), NEVER module.remove_forward_hook()
+- ALWAYS call model.eval() before inference
 - ALWAYS pass attention_mask and pad_token_id=tokenizer.eos_token_id to model.generate()
-- Use "### Prompt: ...\\n### Response:" format for all prompts
-- For idk prompt use: f"I don't know{{tokenizer.eos_token}}" (not eos_id)
-- out.hidden_states[-1] is a TUPLE of layer tensors, NOT a single tensor. You must index it: out.hidden_states[-1][1:][TARGET_LAYER]
-- First sample after filtering = forget_set, rest = retain_set (simple index split, not by answer value)
-- The script must run with: python super/forget.py
-- Write ONLY Python code, no markdown"""
+- out.hidden_states[-1] is a TUPLE, index as: out.hidden_states[-1][1:][layer_idx]
+- print_sample prompt must NOT include item['response'] — only "### Prompt: ...\\n### Response:"
+- Default method is Moore-Penrose (--rank-decomposition=no), NOT low-rank
+- LAMBDA MUST be 1.0 (not 1e-4 or smaller). Small lambda destroys retain knowledge.
+- Use retain_set[:500] (not [:100]) to preserve retain knowledge. More retain samples = better retention.
+- Write ONLY Python code, no markdown, no explanations"""
     return prompt
 
 # ---------- VALIDATE ----------
