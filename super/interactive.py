@@ -211,10 +211,11 @@ while True:
             "--forget-response", forget_response or "",
         ])
 
-        # Reload model after unlearning
-        print("\nReloading model after unlearning...")
+        # Reload model after unlearning — use the saved unlearned model
+        unlearned_path = "checkpoints/unlearned_model"
+        print(f"\nReloading unlearned model from {unlearned_path}...")
         base_new = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16, device_map="auto")
-        model = PeftModel.from_pretrained(base_new, ckpts[-1])
+        model = PeftModel.from_pretrained(base_new, unlearned_path)
         model.eval()
 
         # Verify

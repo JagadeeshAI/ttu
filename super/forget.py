@@ -109,7 +109,7 @@ def print_sample(model, tokenizer, item, label=""):
     print(f"CORRECT: {item['response']}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="RePAIR/LUNAR Unlearning Method")
+    parser = argparse.ArgumentParser(description="RePAIR/LUNAR Machine Unlearning Method")
     parser.add_argument("--rank-decomposition", type=str, default="no", choices=["yes", "no"], help="Use rank decomposition for unlearning")
     parser.add_argument("--rank", type=int, default=32, help="Rank for low-rank approximation")
     args = parser.parse_args()
@@ -154,3 +154,9 @@ D) HP1.441"""
     eval_accuracy(model, tokenizer, retain_set, label="RETAIN")
     print_sample(model, tokenizer, forget_set[0], label="FORGET")
     print_sample(model, tokenizer, random.choice(retain_set), label="RETAIN")
+
+    save_path = "checkpoints/unlearned_model"
+    print(f"Saving unlearned model to {save_path}...")
+    model.save_pretrained(save_path)
+    tokenizer.save_pretrained(save_path)
+    print("Unlearned model saved.")

@@ -196,6 +196,13 @@ The main block MUST contain ALL of the following IN ORDER:
 4f. AFTER UNLEARNING:
 - Same eval_accuracy and print_sample again
 
+4g. SAVE THE UNLEARNED MODEL (CRITICAL — without this, interactive.py cannot reload the unlearned weights):
+  save_path = "checkpoints/unlearned_model"
+  print(f"Saving unlearned model to {{save_path}}...")
+  model.save_pretrained(save_path)
+  tokenizer.save_pretrained(save_path)
+  print("Unlearned model saved.")
+
 CRITICAL RULES:
 - Structure code as FUNCTIONS (get_activations, compute_steering_vector, make_idk_samples, collect_H_O_prime, unlearn_moore_penrose, unlearn_low_rank, eval_accuracy, print_sample) + main block
 - from peft import PeftModel (NOT from transformers)
